@@ -24,6 +24,29 @@ BROKERS = [
     "BofA", "Bank of America", "Merrill Lynch",
 ]
 
+BROKER_ALIASES = {
+    "元大": "元大",
+    "凱基": "凱基",
+    "富邦": "富邦",
+    "永豐": "永豐",
+    "國泰": "國泰",
+    "群益": "群益",
+    "統一": "統一",
+    "兆豐": "兆豐",
+    "玉山": "玉山",
+    "台新": "台新",
+    "中信": "中信",
+    "中國信託": "中國信託",
+    "華南永昌": "華南永昌",
+    "元富": "元富",
+    "國票": "國票",
+    "宏遠": "宏遠",
+    "新光": "新光",
+    "合庫": "合庫",
+    "康和": "康和",
+    "日盛": "日盛",
+}
+
 
 def init_state():
     st.session_state.setdefault("rows", [])
@@ -84,8 +107,7 @@ def extract_stock_code(text):
     return ""
 
 
-def segments_after(text, label, length=100):
-    label_pattern = re.escape(label).replace(r"\ ", r"\s*")
+def segments_after_pattern(text, label_pattern, length=100):
     pattern = rf"{label_pattern}\s*(?:至|為|到|:|：|=)?\s*(?:NT\$|TWD|新台幣|台幣|\$)?\s*"
     for match in re.finditer(pattern, text, re.IGNORECASE):
         yield text[match.end():match.end() + length]
@@ -102,13 +124,25 @@ def price_candidates(segment, min_value=50):
 
 def extract_target_price(text):
     text = normalize_text(text).replace(",", "")
-    labels = ["目標價", "目標價格", "Target Price", "Price Target", "TP"]
+    labels = [
+        r"目標(?:價|價格)",
+        r"Target\s*Price",
+        r"Price\s*Target",
+        r"\bTP\b",
+    ]
     candidates = []
     for label in labels:
-        for segment in segments_after(text, label, 100):
-            stop = re.search(r"EPS|收盤|大盤|市值|股本|日期|評等|QoQ|YoY|毛利|營收", segment, re.I)
+        for segment in segments_after_pattern(text, label, 120):
+            stop = re.search(
+                r"EPS|收盤|大盤|市值|股本|日期|評等|QoQ|YoY|毛利|營收|電話|地址|傳真|"
+                r"Email|E-mail|電子信箱|免責|聲明|服務據點|研究員|分析師",
+                segment,
+                re.I,
+            )
             scoped = segment[:stop.start()] if stop else segment
             candidates.extend(price_candidates(scoped, 50))
+
+    candidates = [value for value in candidates if value < 5000]
     return max(candidates) if candidates else None
 
 
@@ -123,6 +157,16 @@ def extract_broker(text, filename=""):
     for broker in BROKERS:
         if broker.lower() in combined.lower() or re.sub(r"\s+", "", broker).lower() in compact:
             return broker
+
+    broker_context = compact[:5000] + compact[-4000:]
+    for alias, display_name in BROKER_ALIASES.items():
+        compact_alias = re.sub(r"\s+", "", alias).lower()
+        if compact_alias not in broker_context:
+            continue
+        alias_index = broker_context.find(compact_alias)
+        nearby = broker_context[max(0, alias_index - 80):alias_index + 120]
+        if any(keyword in nearby for keyword in ["投顧", "證券", "研究", "報告", "電話", "地址", "analyst", "research"]):
+            return display_name
 
     patterns = [
         r"(?:券商|研究機構|報告機構|出具機構|機構|Broker|Research)\s*[:：=]?\s*([^\n\r]{2,40})",
