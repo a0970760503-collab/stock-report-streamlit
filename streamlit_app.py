@@ -3,6 +3,7 @@ from io import BytesIO
 
 import fitz
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -170,21 +171,99 @@ def parse_report(uploaded_file):
 def fetch_quote(stock_code):
     symbols = [stock_code] if "." in stock_code else [f"{stock_code}.TW", f"{stock_code}.TWO"]
     for symbol in symbols:
-        try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="1d")
-            if hist is not None and not hist.empty:
-                price = float(hist["Close"].iloc[-1])
+        quote = fetch_quote_yfinance(symbol)
+        if quote["price"]:
+            return quote
+
+        quote = fetch_quote_yahoo_chart(symbol)
+        if quote["price"]:
+            return quote
+
+        quote = fetch_quote_yahoo_page(symbol)
+        if quote["price"]:
+            return quote
+
+    return {"price": None, "name": "", "symbol": "", "source": ""}
+
+
+def fetch_quote_yfinance(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1d")
+        if hist is not None and not hist.empty:
+            price = float(hist["Close"].iloc[-1])
+            name = ""
+            try:
+                info = ticker.get_info()
+                name = info.get("longName") or info.get("shortName") or ""
+            except Exception:
                 name = ""
-                try:
-                    info = ticker.get_info()
-                    name = info.get("longName") or info.get("shortName") or ""
-                except Exception:
-                    name = ""
-                return {"price": price, "name": name, "symbol": symbol}
-        except Exception:
-            continue
-    return {"price": None, "name": "", "symbol": ""}
+            return {"price": price, "name": name, "symbol": symbol, "source": "yfinance"}
+    except Exception:
+        pass
+    return {"price": None, "name": "", "symbol": symbol, "source": ""}
+
+
+def yahoo_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/html,application/xhtml+xml",
+    }
+
+
+def fetch_quote_yahoo_chart(symbol):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "1d", "interval": "1d"}
+    try:
+        response = requests.get(url, params=params, headers=yahoo_headers(), timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        result = (data.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return {"price": None, "name": "", "symbol": symbol, "source": ""}
+        meta = result.get("meta", {})
+        price = meta.get("regularMarketPrice")
+        name = meta.get("shortName") or meta.get("longName") or ""
+        if price:
+            return {"price": float(price), "name": name, "symbol": symbol, "source": "yahoo_chart"}
+    except Exception:
+        pass
+    return {"price": None, "name": "", "symbol": symbol, "source": ""}
+
+
+def fetch_quote_yahoo_page(symbol):
+    url = f"https://tw.stock.yahoo.com/quote/{symbol}"
+    try:
+        response = requests.get(url, headers=yahoo_headers(), timeout=12)
+        response.raise_for_status()
+        text = re.sub(r"\s+", " ", response.text)
+        code = re.search(r"\d{4}", symbol)
+        code_text = code.group(0) if code else ""
+        name = ""
+        name_match = re.search(rf"#?\s*([^<#\s]+)\s+{code_text}\b", text)
+        if name_match:
+            name = name_match.group(1)
+
+        patterns = [
+            rf"{code_text}\b[\s\S]{{0,260}}?加入自選股\s*([\d,]+(?:\.\d+)?)",
+            r"(?:成交|股價)\s*([-\d,]+(?:\.\d+)?)",
+            r"即時行情[\s\S]{0,180}?成交\s*([-\d,]+(?:\.\d+)?)",
+            r"收盤\s*\|[\s\S]{0,180}?成交\s*([-\d,]+(?:\.\d+)?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            price = number(match.group(1))
+            if price and 0 < price < 10000:
+                return {"price": float(price), "name": name, "symbol": symbol, "source": "yahoo_page"}
+    except Exception:
+        pass
+    return {"price": None, "name": "", "symbol": symbol, "source": ""}
 
 
 def row_key(row):
