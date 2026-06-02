@@ -116,8 +116,19 @@ def segments_after_pattern(text, label_pattern, length=100):
 def price_candidates(segment, min_value=50):
     values = []
     for match in re.finditer(r"\d+(?:\.\d+)?", segment):
+        before = segment[max(0, match.start() - 8):match.start()]
+        after = segment[match.end():match.end() + 8]
+        context = before + match.group(0) + after
+
+        if re.search(r"\d{2,4}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{1,4}", context):
+            continue
+        if re.search(r"\d+\s*[-－]\s*\d+", context):
+            continue
+        if re.search(r"%|％", after):
+            continue
+
         value = number(match.group(0))
-        if value is not None and min_value <= value < 10000:
+        if value is not None and min_value <= value:
             values.append(value)
     return values
 
@@ -142,7 +153,6 @@ def extract_target_price(text):
             scoped = segment[:stop.start()] if stop else segment
             candidates.extend(price_candidates(scoped, 50))
 
-    candidates = [value for value in candidates if value < 5000]
     return max(candidates) if candidates else None
 
 
