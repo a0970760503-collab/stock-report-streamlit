@@ -1,5 +1,6 @@
 streamlit
 pandas
+requests
 yfinance
 PyMuPDF
-requests
+plotly
