@@ -2080,32 +2080,57 @@ def build_frontier_chart(frontier, current_stats):
         )
 
     special_points = [
-        ("最佳夏普", best_sharpe, "star", "#f59e0b", 22),
-        ("最小波動", min_vol, "diamond", "#60a5fa", 20),
-        ("目前配置", current_stats, "circle", "#f472b6", 18),
+        ("最佳夏普", best_sharpe, "star", "#f59e0b", 22, 0, 30),
+        ("最小波動", min_vol, "diamond", "#60a5fa", 20, 0, 30),
+        ("目前配置", current_stats, "circle", "#f472b6", 18, 62, 22),
     ]
-    for label, point, symbol, color, size in special_points:
+    annotations = []
+    for label, point, symbol, color, size, ax, ay in special_points:
         fig.add_trace(
             go.Scatter(
                 x=[point["年化波動"]],
                 y=[point["年化報酬"]],
-                mode="markers+text",
+                mode="markers",
                 name=f"{label} (SR={point['夏普比率']:.2f})",
-                text=[label],
-                textposition="top center",
-                textfont=dict(color="#ffffff", size=14),
                 marker=dict(symbol=symbol, size=size, color=color, line=dict(color="#ffffff", width=2)),
                 hovertemplate=f"{label}<br>年化波動 %{{x:.1f}}%<br>年化報酬 %{{y:.1f}}%<br>夏普比率 {point['夏普比率']:.2f}<extra></extra>",
             )
         )
+        annotations.append(
+            dict(
+                x=point["年化波動"],
+                y=point["年化報酬"],
+                text=label,
+                showarrow=True,
+                arrowcolor="#ffffff",
+                arrowwidth=1,
+                ax=ax,
+                ay=-ay,
+                xanchor="center",
+                yanchor="bottom",
+                font=dict(color="#ffffff", size=14),
+                bgcolor="rgba(15, 23, 42, 0.72)",
+                bordercolor="rgba(255,255,255,0.18)",
+                borderpad=3,
+            )
+        )
 
     fig.update_layout(
-        title=dict(text="Markowitz 效率前緣", x=0.01, y=0.93, font=dict(size=18, color="#ffffff")),
-        height=690,
+        title=dict(text="Markowitz 效率前緣", x=0.02, y=0.98, xanchor="left", font=dict(size=20, color="#ffffff")),
+        height=720,
         paper_bgcolor="#0f172a",
         plot_bgcolor="#0f172a",
-        margin=dict(l=64, r=28, t=74, b=64),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, font=dict(color="#dbe7ff")),
+        margin=dict(l=72, r=36, t=126, b=70),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.08,
+            xanchor="left",
+            x=0.0,
+            bgcolor="rgba(15, 23, 42, 0.65)",
+            font=dict(color="#dbe7ff", size=13),
+        ),
+        annotations=annotations,
         xaxis=dict(title="年化波動度 (%)", gridcolor="#263449", zeroline=False, color="#b9c7dd"),
         yaxis=dict(title="年化預期報酬 (%)", gridcolor="#263449", zeroline=False, color="#b9c7dd"),
         font=dict(family="Arial, sans-serif", color="#dbe7ff"),
@@ -2266,6 +2291,87 @@ def broker_summary_df(report_df):
         })
 
     return pd.DataFrame(rows).sort_values(["報告數", "平均潛在漲幅"], ascending=[False, False])
+
+
+def split_reason_sentences(text):
+    clean = normalize_text(text)
+    if not clean:
+        return []
+    parts = re.split(r"(?<=[。！？；;])\s*|\n+", clean)
+    if len(parts) <= 1:
+        parts = re.split(r"\s{2,}|(?<=\.)\s+", clean)
+    return [part.strip(" ，,。；;") for part in parts if len(part.strip()) >= 12]
+
+
+def extract_broker_reason(text, stock_code="", rating="", target=None):
+    sentences = split_reason_sentences(text)
+    if not sentences:
+        return "報告文字不足，無法擷取評價原因"
+
+    keywords = [
+        "評等", "投資建議", "買進", "加碼", "增持", "持有", "中立", "賣出", "推薦",
+        "目標價", "上修", "下修", "維持", "調升", "調降",
+        "營收", "毛利", "毛利率", "營益率", "淨利", "EPS", "獲利", "成長", "訂單", "需求",
+        "展望", "催化", "風險", "庫存", "市占", "產品組合", "法人",
+        "target price", "rating", "buy", "hold", "sell", "outperform", "overweight",
+    ]
+    stock_text = str(stock_code or "")
+    target_text = "" if target is None or pd.isna(target) else str(int(float(target))) if float(target).is_integer() else f"{float(target):.2f}"
+    rating_text = str(rating or "")
+
+    scored = []
+    for index, sentence in enumerate(sentences):
+        score = 0
+        lowered = sentence.lower()
+        for keyword in keywords:
+            if keyword.lower() in lowered:
+                score += 2
+        if stock_text and stock_text in sentence:
+            score += 2
+        if rating_text and rating_text in sentence:
+            score += 3
+        if target_text and target_text in sentence.replace(",", ""):
+            score += 3
+        if 20 <= len(sentence) <= 180:
+            score += 1
+        if score > 0:
+            scored.append((score, -index, sentence))
+
+    if not scored:
+        return "未在報告文字中找到明確評等或目標價原因"
+
+    selected = []
+    seen = set()
+    for _, _, sentence in sorted(scored, reverse=True):
+        compact = sentence[:90]
+        if compact in seen:
+            continue
+        selected.append(sentence)
+        seen.add(compact)
+        if len(selected) >= 3:
+            break
+    return " / ".join(selected)
+
+
+def broker_reason_df(related_reports):
+    rows = []
+    if related_reports.empty:
+        return pd.DataFrame()
+    for _, item in related_reports.iterrows():
+        rows.append({
+            "資料日期": item.get("資料日期", "-"),
+            "券商": item.get("券商", "-"),
+            "評等": item.get("建議/推薦", "-") or "-",
+            "目標價": item.get("目標價"),
+            "潛在漲幅": item.get("漲幅"),
+            "評價原因": extract_broker_reason(
+                item.get("原文", ""),
+                item.get("股票", ""),
+                item.get("建議/推薦", ""),
+                item.get("目標價"),
+            ),
+        })
+    return pd.DataFrame(rows)
 
 
 def broker_portfolio_universe(report_df, history_days):
@@ -2437,6 +2543,12 @@ def render_broker_report_analysis_app():
                 detail_cols = ["資料日期", "券商", "建議/推薦", "目前價", "目標價", "漲幅", "情境報酬"]
                 detail_cols = [col for col in detail_cols if col in related_reports.columns]
                 st.dataframe(format_analysis_df(related_reports[detail_cols]), use_container_width=True, hide_index=True)
+                st.subheader("券商評價原因")
+                reasons = broker_reason_df(related_reports)
+                if reasons.empty:
+                    st.info("沒有可擷取的評價原因。")
+                else:
+                    st.dataframe(format_analysis_df(reasons), use_container_width=True, hide_index=True)
             with right:
                 hist = analysis_history(row, history_days)
                 forecast = forecast_history(row, hist, forecast_days, scenario)
