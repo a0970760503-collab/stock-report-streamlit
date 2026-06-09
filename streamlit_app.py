@@ -1,6 +1,7 @@
 import re
 import math
 import random
+import sqlite3
 from io import BytesIO
 from datetime import datetime
 
@@ -13,6 +14,8 @@ import yfinance as yf
 
 
 st.set_page_config(page_title="股票報表系統", layout="wide", initial_sidebar_state="expanded")
+
+DB_PATH = "stock_data.db"
 
 
 def apply_app_style():
@@ -883,7 +886,7 @@ def init_tab_state():
     st.session_state.setdefault("multi_processed_files", set())
 
 
-def add_row_to(bucket, stock, company, broker, date, current, target, rating="", file_name=""):
+def add_row_to(bucket, stock, company, broker, date, current, target, rating="", file_name="", raw_text=""):
     if not stock or current is None:
         return False
     target_value = None if target is None else float(target)
@@ -897,6 +900,7 @@ def add_row_to(bucket, stock, company, broker, date, current, target, rating="",
         "建議/推薦": rating or "",
         "目前價": float(current),
         "目標價": target_value,
+        "原文": raw_text or "",
     }
     row["漲幅"] = None if target_value is None else ((target_value - row["目前價"]) / row["目前價"]) * 100
 
@@ -946,6 +950,7 @@ def process_tab_uploads(files, row_key_name, pending_key_name, processed_key_nam
                     parsed["target"],
                     parsed.get("rating", ""),
                     parsed.get("file_name", ""),
+                    parsed.get("raw_text", ""),
                 ):
                     added += 1
                 else:
@@ -973,7 +978,7 @@ def render_pending(pending_key_name, row_key_name, prefix):
             manual_price = c1.text_input("手動目前價", key=f"{prefix}_pending_price_{index}")
             if c2.button("加入表格", key=f"{prefix}_add_pending_{index}"):
                 price = quote["price"] or number(manual_price)
-                if add_row_to(row_key_name, item["stock"], quote["name"], item["broker"], item["date"], price, item["target"], item.get("rating", ""), item.get("file_name", "")):
+                if add_row_to(row_key_name, item["stock"], quote["name"], item["broker"], item["date"], price, item["target"], item.get("rating", ""), item.get("file_name", ""), item.get("raw_text", "")):
                     st.session_state[pending_key_name].pop(index)
                     st.rerun()
                 else:
@@ -1113,17 +1118,513 @@ def max_drawdown(close):
 def history_metrics(stock_code, days):
     hist = fetch_history(stock_code, days)
     if hist.empty:
-        return {"歷史報酬": None, "波動": None, "最大回撤": None, "history": hist}
+        return {"歷史報酬": None, "波動": None, "最大回撤": None, "低基期位置": None, "history": hist}
     close = hist["收盤價"]
     returns = close.pct_change().dropna()
     historical_return = ((close.iloc[-1] / close.iloc[0]) - 1) * 100 if len(close) >= 2 else None
     volatility = returns.std() * (252 ** 0.5) * 100 if not returns.empty else None
+    low = close.min()
+    high = close.max()
+    base_position = None if high == low else ((close.iloc[-1] - low) / (high - low)) * 100
     return {
         "歷史報酬": None if historical_return is None else float(historical_return),
         "波動": None if volatility is None or pd.isna(volatility) else float(volatility),
         "最大回撤": max_drawdown(close),
+        "低基期位置": None if base_position is None or pd.isna(base_position) else float(base_position),
         "history": hist,
     }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_market_profile(stock_code, days):
+    symbols = [stock_code] if "." in str(stock_code) else [f"{stock_code}.TW", f"{stock_code}.TWO"]
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period=history_period(days), auto_adjust=False)
+            if hist is None or hist.empty:
+                continue
+
+            avg_volume_lots = None
+            if "Volume" in hist:
+                volume = hist["Volume"].dropna().tail(20)
+                if not volume.empty:
+                    avg_volume_lots = float(volume.mean() / 1000)
+
+            market_cap_million = None
+            try:
+                info = ticker.get_info()
+                market_cap = info.get("marketCap")
+                if market_cap:
+                    market_cap_million = float(market_cap / 1_000_000)
+            except Exception:
+                market_cap_million = None
+
+            return {
+                "平均成交張數": avg_volume_lots,
+                "市值百萬元": market_cap_million,
+                "行情代號": symbol,
+            }
+        except Exception:
+            continue
+    return {"平均成交張數": None, "市值百萬元": None, "行情代號": ""}
+
+
+def text_window(text, start, radius=42):
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    return clean[max(0, start - radius):start + radius].strip()
+
+
+def extract_percent_after(patterns, text):
+    clean = re.sub(r"\s+", " ", text or "")
+    for pattern in patterns:
+        for match in re.finditer(pattern, clean, re.IGNORECASE):
+            value = number(match.group(1))
+            if value is not None:
+                return float(value), text_window(clean, match.start())
+    return None, ""
+
+
+def yfinance_symbols(stock_code):
+    return [stock_code] if "." in str(stock_code) else [f"{stock_code}.TW", f"{stock_code}.TWO"]
+
+
+def financial_values(statement, aliases):
+    if statement is None or statement.empty:
+        return []
+    normalized = {str(index).lower().replace(" ", ""): index for index in statement.index}
+    row_name = None
+    for alias in aliases:
+        key = alias.lower().replace(" ", "")
+        if key in normalized:
+            row_name = normalized[key]
+            break
+    if row_name is None:
+        return []
+
+    columns = list(statement.columns)
+    try:
+        columns = sorted(columns, key=lambda value: pd.to_datetime(value), reverse=True)
+    except Exception:
+        pass
+
+    values = []
+    for column in columns:
+        value = number(statement.loc[row_name, column])
+        if value is not None and not pd.isna(value):
+            values.append(float(value))
+    return values
+
+
+def rate_change(new, old):
+    if new is None or old in (None, 0):
+        return None
+    return (new / old - 1) * 100
+
+
+def format_money_short(value):
+    if value is None or pd.isna(value):
+        return "-"
+    value = float(value)
+    if abs(value) >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    return f"{value:,.0f}"
+
+
+def holder_pct_change(value):
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, str):
+        value = value.replace("%", "").replace("+", "").strip()
+    parsed = number(value)
+    if parsed is None:
+        return None
+    return float(parsed)
+
+
+def stock_id(value):
+    return str(value or "").split(".")[0].strip()
+
+
+def init_stock_database():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_revenue (
+                stock_id TEXT NOT NULL,
+                date TEXT,
+                revenue_year INTEGER NOT NULL,
+                revenue_month INTEGER NOT NULL,
+                revenue REAL NOT NULL,
+                source TEXT DEFAULT 'import',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (stock_id, revenue_year, revenue_month)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS institutional_buy_sell (
+                stock_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                name TEXT NOT NULL,
+                buy REAL DEFAULT 0,
+                sell REAL DEFAULT 0,
+                source TEXT DEFAULT 'import',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (stock_id, date, name)
+            )
+            """
+        )
+
+
+def database_counts():
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        revenue_count = conn.execute("SELECT COUNT(*) FROM monthly_revenue").fetchone()[0]
+        institutional_count = conn.execute("SELECT COUNT(*) FROM institutional_buy_sell").fetchone()[0]
+    return revenue_count, institutional_count
+
+
+def load_monthly_revenue_from_db(code):
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT stock_id, date, revenue_year, revenue_month, revenue
+            FROM monthly_revenue
+            WHERE stock_id = ?
+            ORDER BY revenue_year, revenue_month
+            """,
+            conn,
+            params=(stock_id(code),),
+        )
+
+
+def load_institutional_from_db(code, days=21):
+    init_stock_database()
+    start_date = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT stock_id, date, name, buy, sell
+            FROM institutional_buy_sell
+            WHERE stock_id = ? AND date >= ?
+            ORDER BY date, name
+            """,
+            conn,
+            params=(stock_id(code), start_date),
+        )
+
+
+def save_monthly_revenue_to_db(df, source="import"):
+    if df.empty:
+        return 0
+    work = df.copy()
+    if "stock_id" not in work and "data_id" in work:
+        work["stock_id"] = work["data_id"]
+    required = {"stock_id", "revenue_year", "revenue_month", "revenue"}
+    if not required.issubset(work.columns):
+        return 0
+    if "date" not in work:
+        work["date"] = work.apply(lambda row: f"{int(row['revenue_year']):04d}-{int(row['revenue_month']):02d}-01", axis=1)
+
+    rows = []
+    for _, row in work.iterrows():
+        revenue = number(row.get("revenue"))
+        year = number(row.get("revenue_year"))
+        month = number(row.get("revenue_month"))
+        if revenue is None or year is None or month is None:
+            continue
+        rows.append((stock_id(row.get("stock_id")), str(row.get("date") or ""), int(year), int(month), float(revenue), source))
+
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO monthly_revenue
+                (stock_id, date, revenue_year, revenue_month, revenue, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def save_institutional_to_db(df, source="import"):
+    if df.empty:
+        return 0
+    work = df.copy()
+    if "stock_id" not in work and "data_id" in work:
+        work["stock_id"] = work["data_id"]
+    required = {"stock_id", "date", "name", "buy", "sell"}
+    if not required.issubset(work.columns):
+        return 0
+
+    rows = []
+    for _, row in work.iterrows():
+        buy = number(row.get("buy")) or 0
+        sell = number(row.get("sell")) or 0
+        date_value = pd.to_datetime(row.get("date"), errors="coerce")
+        if pd.isna(date_value):
+            continue
+        rows.append((stock_id(row.get("stock_id")), date_value.strftime("%Y-%m-%d"), str(row.get("name")), float(buy), float(sell), source))
+
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO institutional_buy_sell
+                (stock_id, date, name, buy, sell, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def read_uploaded_csv(uploaded_file):
+    raw = uploaded_file.getvalue()
+    for encoding in ["utf-8-sig", "utf-8", "cp950", "big5"]:
+        try:
+            return pd.read_csv(BytesIO(raw), encoding=encoding)
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def finmind_headers(token):
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def finmind_data(dataset, stock_code, start_date, end_date=None, token=""):
+    params = {
+        "dataset": dataset,
+        "data_id": str(stock_code).split(".")[0],
+        "start_date": start_date,
+    }
+    if end_date:
+        params["end_date"] = end_date
+    if token:
+        params["token"] = token
+
+    try:
+        response = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params=params,
+            headers=finmind_headers(token),
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", [])
+        return pd.DataFrame(data) if data else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_finmind_revenue_signal(stock_code, token="", allow_api=False):
+    df = load_monthly_revenue_from_db(stock_code)
+    source_name = "SQLite"
+    if df.empty and allow_api:
+        start_date = (pd.Timestamp.today().normalize() - pd.DateOffset(years=6)).strftime("%Y-%m-%d")
+        df = finmind_data("TaiwanStockMonthRevenue", stock_code, start_date, token=token)
+        if not df.empty:
+            save_monthly_revenue_to_db(df, source="finmind")
+            df = load_monthly_revenue_from_db(stock_code)
+            source_name = "FinMind API -> SQLite"
+
+    if df.empty or "revenue" not in df:
+        return {
+            "營收條件": False,
+            "營收特徵": "SQLite 無資料",
+            "營收原因": "本機資料庫沒有月營收資料；可匯入 CSV，或勾選缺資料時用 FinMind 更新",
+            "營收MoM": None,
+            "累積YoY": None,
+        }
+
+    df = df.copy()
+    df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
+    df["revenue_month"] = pd.to_numeric(df["revenue_month"], errors="coerce")
+    df["revenue_year"] = pd.to_numeric(df["revenue_year"], errors="coerce")
+    df["date_dt"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df = df.dropna(subset=["revenue", "revenue_month", "revenue_year", "date_dt"]).sort_values("date_dt")
+    if df.empty:
+        return {
+            "營收條件": False,
+            "營收特徵": "SQLite 資料不足",
+            "營收原因": "本機月營收資料欄位不完整",
+            "營收MoM": None,
+            "累積YoY": None,
+        }
+
+    latest = df.iloc[-1]
+    previous = df.iloc[-2] if len(df) >= 2 else None
+    mom = rate_change(latest["revenue"], previous["revenue"]) if previous is not None else None
+
+    latest_year = int(latest["revenue_year"])
+    latest_month = int(latest["revenue_month"])
+    current_ytd = df[(df["revenue_year"] == latest_year) & (df["revenue_month"] <= latest_month)]["revenue"].sum()
+    previous_ytd = df[(df["revenue_year"] == latest_year - 1) & (df["revenue_month"] <= latest_month)]["revenue"].sum()
+    cumulative_yoy = rate_change(current_ytd, previous_ytd) if previous_ytd else None
+
+    revenue_high = latest["revenue"] >= df["revenue"].max()
+    feature = ""
+    if revenue_high:
+        feature = "月營收創高"
+        reason = f"{source_name}：{latest_year}/{latest_month:02d} 月營收 {format_money_short(latest['revenue'])}，為資料庫區間最高"
+    elif mom is not None and mom >= 10:
+        feature = "月營收 MoM +10%"
+        reason = f"{source_name}：{latest_year}/{latest_month:02d} 月營收 {format_money_short(latest['revenue'])}，月增 {mom:.1f}%"
+    elif cumulative_yoy is not None and cumulative_yoy >= 10:
+        feature = "累積 YoY +10%"
+        reason = f"{source_name}：{latest_year} 年累積至 {latest_month} 月營收年增 {cumulative_yoy:.1f}%"
+    else:
+        reason = (
+            f"{latest_year}/{latest_month:02d} 月營收未達策略門檻"
+            f"；MoM {mom:.1f}%" if mom is not None else f"{latest_year}/{latest_month:02d} 月營收未達策略門檻"
+        )
+        if cumulative_yoy is not None:
+            reason += f"，累積 YoY {cumulative_yoy:.1f}%"
+
+    return {
+        "營收條件": bool(feature),
+        "營收特徵": feature or "未通過",
+        "營收原因": reason,
+        "營收MoM": mom,
+        "累積YoY": cumulative_yoy,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_finmind_institutional_signal(stock_code, token="", allow_api=False):
+    df = load_institutional_from_db(stock_code)
+    source_name = "SQLite"
+    if df.empty and allow_api:
+        end_date = pd.Timestamp.today().normalize()
+        start_date = (end_date - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
+        df = finmind_data(
+            "TaiwanStockInstitutionalInvestorsBuySell",
+            stock_code,
+            start_date,
+            end_date.strftime("%Y-%m-%d"),
+            token,
+        )
+        if not df.empty:
+            save_institutional_to_db(df, source="finmind")
+            df = load_institutional_from_db(stock_code)
+            source_name = "FinMind API -> SQLite"
+
+    if df.empty or not {"date", "name", "buy", "sell"}.issubset(df.columns):
+        return {
+            "法人買入": False,
+            "法人原因": "本機資料庫沒有法人買賣資料；可匯入 CSV，或勾選缺資料時用 FinMind 更新",
+            "外資投信買超張數": None,
+        }
+
+    df = df.copy()
+    df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+    df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+    df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date_dt"])
+    target = df[df["name"].isin(["Foreign_Investor", "Investment_Trust"])]
+    if target.empty:
+        return {
+            "法人買入": False,
+            "法人原因": "法人資料沒有 Foreign_Investor / Investment_Trust 類別",
+            "外資投信買超張數": None,
+        }
+
+    latest_date = target["date_dt"].max()
+    latest_rows = target[target["date_dt"] == latest_date]
+    net_shares = float((latest_rows["buy"] - latest_rows["sell"]).sum())
+    net_lots = net_shares / 1000
+    return {
+        "法人買入": net_lots > 0,
+        "法人原因": f"{source_name}：{latest_date.strftime('%Y/%m/%d')} 外資+投信買超 {net_lots:,.0f} 張",
+        "外資投信買超張數": net_lots,
+    }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_yfinance_strategy_signals(stock_code, finmind_token="", allow_finmind_update=False):
+    revenue_signal = fetch_finmind_revenue_signal(stock_code, finmind_token, allow_finmind_update)
+    institutional_signal = fetch_finmind_institutional_signal(stock_code, finmind_token, allow_finmind_update)
+    fallback = {
+        "三率三升": False,
+        "三率原因": "yfinance 無法取得季財報",
+        "營收條件": revenue_signal["營收條件"],
+        "營收特徵": revenue_signal["營收特徵"],
+        "營收原因": revenue_signal["營收原因"],
+        "營收MoM": revenue_signal["營收MoM"],
+        "累積YoY": revenue_signal["累積YoY"],
+        "法人買入": institutional_signal["法人買入"],
+        "法人原因": institutional_signal["法人原因"],
+        "外資投信買超張數": institutional_signal["外資投信買超張數"],
+        "策略資料來源": "三率:yfinance 無資料 / 營收與法人:SQLite",
+    }
+
+    for symbol in yfinance_symbols(stock_code):
+        try:
+            ticker = yf.Ticker(symbol)
+            statement = None
+            for attr in ["quarterly_income_stmt", "quarterly_financials"]:
+                try:
+                    candidate = getattr(ticker, attr)
+                    if candidate is not None and not candidate.empty:
+                        statement = candidate
+                        break
+                except Exception:
+                    continue
+
+            revenue = financial_values(statement, ["Total Revenue", "Operating Revenue", "Revenue"])
+            gross_profit = financial_values(statement, ["Gross Profit"])
+            operating_income = financial_values(statement, ["Operating Income", "Operating Income Or Loss"])
+            net_income = financial_values(statement, ["Net Income", "Net Income Common Stockholders", "Net Income From Continuing Operation Net Minority Interest"])
+            if not any([revenue, gross_profit, operating_income, net_income]):
+                continue
+
+            gross_margin = [gross_profit[i] / revenue[i] * 100 for i in range(min(len(gross_profit), len(revenue))) if revenue[i]]
+            operating_margin = [operating_income[i] / revenue[i] * 100 for i in range(min(len(operating_income), len(revenue))) if revenue[i]]
+            net_margin = [net_income[i] / revenue[i] * 100 for i in range(min(len(net_income), len(revenue))) if revenue[i]]
+
+            three_rate_pass = (
+                len(gross_margin) >= 2
+                and len(operating_margin) >= 2
+                and len(net_margin) >= 2
+                and gross_margin[0] > gross_margin[1]
+                and operating_margin[0] > operating_margin[1]
+                and net_margin[0] > net_margin[1]
+            )
+            if len(gross_margin) >= 2 and len(operating_margin) >= 2 and len(net_margin) >= 2:
+                three_rate_reason = (
+                    f"yfinance 季財報：毛利率 {gross_margin[1]:.1f}%→{gross_margin[0]:.1f}%、"
+                    f"營益率 {operating_margin[1]:.1f}%→{operating_margin[0]:.1f}%、"
+                    f"淨利率 {net_margin[1]:.1f}%→{net_margin[0]:.1f}%"
+                )
+            else:
+                three_rate_reason = "yfinance 季財報缺少營收、毛利、營業利益或淨利欄位，無法判斷三率三升"
+
+            return {
+                "三率三升": three_rate_pass,
+                "三率原因": three_rate_reason,
+                "營收條件": revenue_signal["營收條件"],
+                "營收特徵": revenue_signal["營收特徵"],
+                "營收原因": revenue_signal["營收原因"],
+                "營收MoM": revenue_signal["營收MoM"],
+                "累積YoY": revenue_signal["累積YoY"],
+                "法人買入": institutional_signal["法人買入"],
+                "法人原因": institutional_signal["法人原因"],
+                "外資投信買超張數": institutional_signal["外資投信買超張數"],
+                "策略資料來源": f"三率:yfinance:{symbol} / 營收與法人:SQLite",
+            }
+        except Exception:
+            continue
+
+    return fallback
 
 
 def scenario_rate(name):
@@ -1165,6 +1666,7 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
         "漲幅": None,
         "狀態": "已入表",
         "備註": "",
+        "原文": "",
     }
     for column, default in defaults.items():
         if column not in df:
@@ -1175,6 +1677,7 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
     df["建議/推薦"] = df["建議/推薦"].fillna("")
     df["狀態"] = df["狀態"].fillna("已入表")
     df["備註"] = df["備註"].fillna("")
+    df["原文"] = df["原文"].fillna("")
     df["資料日期_dt"] = df["資料日期"].map(parse_report_date_value)
 
     if recent_only:
@@ -1205,6 +1708,7 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
             "歷史報酬": item["歷史報酬"],
             "波動": item["波動"],
             "最大回撤": item["最大回撤"],
+            "低基期位置": item["低基期位置"],
         })
 
     metric_df = pd.DataFrame(metrics, index=df.index)
@@ -1238,11 +1742,12 @@ def pending_report_rows():
             "漲幅": None,
             "狀態": "待確認",
             "備註": item.get("reason", "Yahoo Finance 抓不到現價或欄位不足"),
+            "原文": item.get("raw_text", ""),
         })
     return rows
 
 
-def aggregate_stock_universe(report_df, history_days, scenario):
+def aggregate_stock_universe(report_df, history_days, scenario, low_base_limit=35, min_volume_lots=200, min_market_cap_million=200000, finmind_token="", allow_finmind_update=False):
     if report_df.empty:
         return report_df.copy()
 
@@ -1270,8 +1775,21 @@ def aggregate_stock_universe(report_df, history_days, scenario):
 
         representative = group.iloc[-1].copy()
         item = history_metrics(stock, history_days)
+        market = fetch_market_profile(stock, history_days)
         rating_text = " / ".join(rating_list)
         broker_text = " / ".join(broker_list)
+        signals = fetch_yfinance_strategy_signals(stock, finmind_token, allow_finmind_update)
+        low_base_pass = item["低基期位置"] is not None and item["低基期位置"] <= low_base_limit
+        volume_pass = market["平均成交張數"] is not None and market["平均成交張數"] >= min_volume_lots
+        market_cap_pass = market["市值百萬元"] is not None and market["市值百萬元"] >= min_market_cap_million
+        strategy_pass = (
+            low_base_pass
+            and signals["三率三升"]
+            and signals["營收條件"]
+            and signals["法人買入"]
+            and volume_pass
+            and market_cap_pass
+        )
         grouped_rows.append({
             "股票": str(stock),
             "公司": representative.get("公司", "-"),
@@ -1288,6 +1806,22 @@ def aggregate_stock_universe(report_df, history_days, scenario):
             "歷史報酬": item["歷史報酬"],
             "波動": item["波動"],
             "最大回撤": item["最大回撤"],
+            "低基期位置": item["低基期位置"],
+            "低基期": low_base_pass,
+            "三率三升": signals["三率三升"],
+            "三率原因": signals["三率原因"],
+            "營收條件": signals["營收條件"],
+            "營收特徵": signals["營收特徵"],
+            "營收原因": signals["營收原因"],
+            "營收MoM": signals["營收MoM"],
+            "累積YoY": signals["累積YoY"],
+            "法人買入": signals["法人買入"],
+            "法人原因": signals["法人原因"],
+            "外資投信買超張數": signals["外資投信買超張數"],
+            "策略資料來源": signals["策略資料來源"],
+            "平均成交張數": market["平均成交張數"],
+            "市值百萬元": market["市值百萬元"],
+            "策略通過": strategy_pass,
             "建議分數": max([rating_score(value) for value in rating_list] or [0]),
             "報告筆數": len(group),
             "券商數": len(broker_list),
@@ -1303,11 +1837,16 @@ def aggregate_stock_universe(report_df, history_days, scenario):
         + df["最大回撤"].fillna(0) * 0.18
         + df["建議分數"].fillna(0)
         + df["報告筆數"].fillna(0) * 0.6
+        + df["低基期"].astype(float).fillna(0) * 8
+        + df["三率三升"].astype(float).fillna(0) * 8
+        + df["營收條件"].astype(float).fillna(0) * 8
+        + df["法人買入"].astype(float).fillna(0) * 6
+        + df["策略通過"].astype(float).fillna(0) * 15
     )
     return df
 
 
-def filter_selection(df, min_return, max_volatility, max_drawdown_limit, max_stocks):
+def filter_selection(df, min_return, max_volatility, max_drawdown_limit, max_stocks, apply_strategy=True, min_volume_lots=200, min_market_cap_million=200000, low_base_limit=35):
     if df.empty:
         return df
     selected = df.copy()
@@ -1320,8 +1859,17 @@ def filter_selection(df, min_return, max_volatility, max_drawdown_limit, max_sto
     drawdown_mask = selected["最大回撤"].isna() | (selected["最大回撤"] >= max_drawdown_limit)
     selected = selected[return_mask & volatility_mask & drawdown_mask]
 
-    if selected.empty:
-        selected = df.copy()
+    if apply_strategy:
+        strategy_mask = (
+            (selected["低基期位置"].notna() & (selected["低基期位置"] <= low_base_limit))
+            & selected["三率三升"].fillna(False)
+            & selected["營收條件"].fillna(False)
+            & selected["法人買入"].fillna(False)
+            & (selected["平均成交張數"].notna() & (selected["平均成交張數"] >= min_volume_lots))
+            & (selected["市值百萬元"].notna() & (selected["市值百萬元"] >= min_market_cap_million))
+        )
+        selected = selected[strategy_mask]
+
     return selected.sort_values("智慧分數", ascending=False).head(max_stocks)
 
 
@@ -1348,10 +1896,18 @@ def format_analysis_df(df):
     for column in ["目前價", "目標價", "最高目標價", "情境目標價", "目標金額", "實際投入金額", "未用餘額", "買進手續費"]:
         if column in display:
             display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
-    for column in ["漲幅", "情境報酬", "歷史報酬", "波動", "最大回撤", "智慧分數", "權重"]:
+    for column in ["漲幅", "情境報酬", "歷史報酬", "波動", "最大回撤", "低基期位置", "營收MoM", "累積YoY", "智慧分數", "權重"]:
         if column in display:
             suffix = "%" if column != "智慧分數" else ""
             display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.1f}{suffix}")
+    for column in ["平均成交張數", "外資投信買超張數"]:
+        if column in display:
+            display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:,.0f}")
+    if "市值百萬元" in display:
+        display["市值百萬元"] = display["市值百萬元"].map(lambda value: "" if pd.isna(value) else f"{value:,.0f}")
+    for column in ["低基期", "三率三升", "營收條件", "法人買入", "策略通過"]:
+        if column in display:
+            display[column] = display[column].map(lambda value: "✅" if bool(value) else "—")
     return display
 
 
@@ -1442,7 +1998,7 @@ def portfolio_stats(returns, weights):
     return {"年化報酬": annual_return, "年化波動": annual_volatility, "夏普比率": sharpe}
 
 
-def simulate_frontier(selected, history_days, count=700):
+def simulate_frontier(selected, history_days, count=3000):
     returns, names = return_matrix(selected, history_days)
     if returns.empty:
         return pd.DataFrame(), names
@@ -1462,6 +2018,89 @@ def simulate_frontier(selected, history_days, count=700):
         item.update({f"{stock} 權重": weight * 100 for stock, weight in zip(stocks, weights)})
         rows.append(item)
     return pd.DataFrame(rows), names
+
+
+def efficient_frontier_curve(frontier):
+    if frontier.empty:
+        return pd.DataFrame()
+    clean = frontier.dropna(subset=["年化波動", "年化報酬"]).sort_values("年化波動")
+    rows = []
+    best_return = -float("inf")
+    for _, row in clean.iterrows():
+        annual_return = float(row["年化報酬"])
+        if annual_return >= best_return:
+            rows.append(row)
+            best_return = annual_return
+    return pd.DataFrame(rows)
+
+
+def build_frontier_chart(frontier, current_stats):
+    curve = efficient_frontier_curve(frontier)
+    best_sharpe = frontier.loc[frontier["夏普比率"].idxmax()]
+    min_vol = frontier.loc[frontier["年化波動"].idxmin()]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattergl(
+            x=frontier["年化波動"],
+            y=frontier["年化報酬"],
+            mode="markers",
+            name="隨機組合",
+            marker=dict(
+                size=5,
+                opacity=0.72,
+                color=frontier["夏普比率"],
+                colorscale=[[0, "#ef4444"], [0.5, "#fff7a8"], [1, "#22c55e"]],
+                colorbar=dict(title="夏普比率", tickfont=dict(color="#e5eefb"), titlefont=dict(color="#ffffff")),
+                line=dict(width=0),
+            ),
+            hovertemplate="年化波動 %{x:.1f}%<br>年化報酬 %{y:.1f}%<br>夏普比率 %{marker.color:.2f}<extra></extra>",
+        )
+    )
+    if not curve.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=curve["年化波動"],
+                y=curve["年化報酬"],
+                mode="lines",
+                name="效率前緣",
+                line=dict(color="#ffffff", width=3),
+                hovertemplate="效率前緣<br>年化波動 %{x:.1f}%<br>年化報酬 %{y:.1f}%<extra></extra>",
+            )
+        )
+
+    special_points = [
+        ("最佳夏普", best_sharpe, "star", "#f59e0b", 22),
+        ("最小波動", min_vol, "diamond", "#60a5fa", 20),
+        ("目前配置", current_stats, "circle", "#f472b6", 18),
+    ]
+    for label, point, symbol, color, size in special_points:
+        fig.add_trace(
+            go.Scatter(
+                x=[point["年化波動"]],
+                y=[point["年化報酬"]],
+                mode="markers+text",
+                name=f"{label} (SR={point['夏普比率']:.2f})",
+                text=[label],
+                textposition="top center",
+                textfont=dict(color="#ffffff", size=14),
+                marker=dict(symbol=symbol, size=size, color=color, line=dict(color="#ffffff", width=2)),
+                hovertemplate=f"{label}<br>年化波動 %{{x:.1f}}%<br>年化報酬 %{{y:.1f}}%<br>夏普比率 {point['夏普比率']:.2f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=dict(text="Markowitz 效率前緣", x=0.01, y=0.93, font=dict(size=18, color="#ffffff")),
+        height=690,
+        paper_bgcolor="#0f172a",
+        plot_bgcolor="#0f172a",
+        margin=dict(l=64, r=28, t=74, b=64),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, font=dict(color="#dbe7ff")),
+        xaxis=dict(title="年化波動度 (%)", gridcolor="#263449", zeroline=False, color="#b9c7dd"),
+        yaxis=dict(title="年化預期報酬 (%)", gridcolor="#263449", zeroline=False, color="#b9c7dd"),
+        font=dict(family="Arial, sans-serif", color="#dbe7ff"),
+    )
+    return fig
 
 
 def selected_weight_map(selected):
@@ -1619,6 +2258,7 @@ def render_pdf_report_page():
 
 def render_stock_picker_page():
     st.title("📈 券商研究報告分析工具")
+    init_stock_database()
 
     base_rows = st.session_state.get("auto_rows", [])
     brokers = sorted({row.get("券商", "-") for row in base_rows + SAMPLE_ROWS if row.get("券商")})
@@ -1657,7 +2297,28 @@ def render_stock_picker_page():
         recent_days = st.number_input("近期報告天數", min_value=1, max_value=365, value=90, step=5, disabled=not recent_only)
         use_sample = st.checkbox("使用範例資料", value=not bool(base_rows))
 
+        st.header("🗄️ 本機資料庫")
+        revenue_count, institutional_count = database_counts()
+        st.caption(f"月營收 {revenue_count:,} 筆；法人買賣 {institutional_count:,} 筆")
+        revenue_csv = st.file_uploader("匯入月營收 CSV", type=["csv"], key="monthly_revenue_csv")
+        institutional_csv = st.file_uploader("匯入法人買賣 CSV", type=["csv"], key="institutional_csv")
+        if st.button("匯入資料庫", key="import_stock_database", use_container_width=True):
+            imported_revenue = 0
+            imported_institutional = 0
+            if revenue_csv:
+                imported_revenue = save_monthly_revenue_to_db(read_uploaded_csv(revenue_csv), source="csv")
+            if institutional_csv:
+                imported_institutional = save_institutional_to_db(read_uploaded_csv(institutional_csv), source="csv")
+            st.cache_data.clear()
+            st.success(f"已匯入月營收 {imported_revenue:,} 筆、法人買賣 {imported_institutional:,} 筆")
+
         st.header("🔎 智慧選股")
+        allow_finmind_update = st.checkbox("缺資料時用 FinMind 更新資料庫", value=False)
+        finmind_token = st.text_input("FinMind Token（可留空）", type="password", disabled=not allow_finmind_update, help="只有勾選更新資料庫時才會使用 FinMind；留空會嘗試公開額度。")
+        apply_strategy = st.checkbox("套用策略交集", value=True)
+        low_base_limit = st.slider("低基期位置上限 (%)", min_value=0.0, max_value=100.0, value=35.0, step=5.0, disabled=not apply_strategy)
+        min_volume_lots = st.number_input("每日成交張數下限", min_value=0, max_value=100000, value=200, step=50, disabled=not apply_strategy)
+        min_market_cap_million = st.number_input("市值下限（百萬元）", min_value=0, max_value=10000000, value=200000, step=10000, disabled=not apply_strategy)
         max_volatility = st.slider("波動上限 (%)", min_value=1.0, max_value=120.0, value=55.0, step=1.0)
         min_return = st.slider("情境報酬下限 (%)", min_value=-50.0, max_value=200.0, value=0.0, step=1.0)
         max_drawdown_limit = st.slider("最大回撤下限 (%)", min_value=-100.0, max_value=0.0, value=-35.0, step=1.0)
@@ -1687,8 +2348,27 @@ def render_stock_picker_page():
         history_days,
         scenario,
     )
-    stock_universe = aggregate_stock_universe(report_universe, history_days, scenario)
-    selected_raw = filter_selection(stock_universe, min_return, max_volatility, max_drawdown_limit, max_stocks)
+    stock_universe = aggregate_stock_universe(
+        report_universe,
+        history_days,
+        scenario,
+        low_base_limit,
+        min_volume_lots,
+        min_market_cap_million,
+        finmind_token,
+        allow_finmind_update,
+    )
+    selected_raw = filter_selection(
+        stock_universe,
+        min_return,
+        max_volatility,
+        max_drawdown_limit,
+        max_stocks,
+        apply_strategy,
+        min_volume_lots,
+        min_market_cap_million,
+        low_base_limit,
+    )
     selected = add_weights(selected_raw, weight_mode)
 
     overview_tab, stock_tab, portfolio_tab, smart_tab = st.tabs(["📋 報告總覽", "🔍 個股深入分析", "📦 投資組合分析", "🔬 智慧選股"])
@@ -1843,7 +2523,24 @@ def render_stock_picker_page():
                 if frontier.empty:
                     st.info("歷史資料不足，無法建立效率前緣")
                 else:
-                    st.scatter_chart(frontier, x="年化波動", y="年化報酬", color="夏普比率")
+                    st.markdown("### 效率前緣（Monte Carlo 3,000 組合）")
+                    st.plotly_chart(build_frontier_chart(frontier, current_stats), use_container_width=True)
+                    st.caption(
+                        "每個點是一組隨機權重投資組合；白線是在相同或更低波動下能取得最高報酬的組合，也就是效率前緣。"
+                    )
+                    with st.expander("這張圖怎麼算？", expanded=True):
+                        st.markdown(
+                            """
+                            1. 先用每檔股票的歷史收盤價計算每日報酬率：`今日收盤價 / 昨日收盤價 - 1`。
+                            2. Monte Carlo 會隨機產生 3,000 組權重，且每組權重都會正規化成合計 100%。
+                            3. 每組投資組合的每日報酬 = 各股票每日報酬 × 對應權重後加總。
+                            4. 年化報酬 = 投資組合每日平均報酬 × 252 × 100。
+                            5. 年化波動度 = 投資組合每日報酬標準差 × √252 × 100。
+                            6. 夏普比率 = 年化報酬 ÷ 年化波動度；目前未扣無風險利率。
+
+                            圖上的 **最佳夏普** 是夏普比率最高的隨機組合，**最小波動** 是年化波動度最低的組合，**目前配置** 是你在左側權重滑桿設定後換算出的組合。
+                            """
+                        )
 
                 st.subheader("關鍵組合比較")
                 comparison = key_portfolio_table(frontier, portfolio_rows)
@@ -1911,15 +2608,47 @@ def render_stock_picker_page():
         if stock_universe.empty:
             st.info("尚無候選股票")
         else:
-            feature_cols = ["股票", "公司", "券商", "報告筆數", "目前價", "情境報酬", "建議/推薦", "目標價", "最高目標價", "歷史報酬", "波動", "最大回撤", "智慧分數"]
-            with st.expander("各股完整特徵表（展開查看）", expanded=True):
-                st.dataframe(format_analysis_df(stock_universe[feature_cols]), use_container_width=True, hide_index=True)
+            st.markdown(
+                """
+                **策略邏輯：** 先以上傳報告形成股票池；三率用 yfinance 季財報，月營收與外資+投信買超優先讀 SQLite 本機資料庫，成交量與市值用 yfinance，最後取策略條件交集。
+                """
+            )
+            with st.expander("策略條件怎麼判斷？", expanded=True):
+                st.markdown(
+                    """
+                    1. **低基期**：用歷史區間內的收盤價位置計算，`(目前價 - 區間最低價) / (區間最高價 - 區間最低價) × 100`，低於左側設定門檻就通過。
+                    2. **三率三升**：用 yfinance 季財報計算毛利率、營益率、淨利率，三者都比前一季上升就通過。
+                    3. **營收條件三選一**：用本機資料庫的月營收判斷 `月營收創高`、`月營收 MoM +10%`、`累積 YoY +10%` 任一項；資料可由 CSV 匯入，或勾選後用 FinMind 補缺漏。
+                    4. **法人買入**：用本機資料庫的法人買賣表計算最近可得交易日的 `外資 + 投信` 買超張數，大於 0 就通過；資料可由 CSV 匯入，或勾選後用 FinMind 補缺漏。
+                    5. **成交量**：用最近 20 個交易日平均成交股數換算成張數，門檻預設 200 張。
+                    6. **市值**：用 yfinance 的 marketCap 換算成百萬元，門檻預設 200,000 百萬元。
+                    """
+                )
+
+            feature_cols = [
+                "股票", "公司", "券商", "報告筆數", "目前價", "情境報酬", "建議/推薦", "目標價",
+                "低基期位置", "低基期", "三率三升", "營收條件", "營收特徵", "法人買入",
+                "營收MoM", "累積YoY", "外資投信買超張數", "平均成交張數", "市值百萬元",
+                "策略通過", "三率原因", "營收原因", "法人原因", "策略資料來源", "智慧分數",
+            ]
+            existing_feature_cols = [col for col in feature_cols if col in stock_universe.columns]
+            with st.expander("各股策略檢核表（展開查看）", expanded=True):
+                st.dataframe(format_analysis_df(stock_universe[existing_feature_cols]), use_container_width=True, hide_index=True)
+
+            with st.expander("各股完整分析資料"):
+                full_cols = ["股票", "公司", "券商", "報告筆數", "目前價", "情境報酬", "建議/推薦", "目標價", "最高目標價", "歷史報酬", "波動", "最大回撤", "智慧分數"]
+                full_cols = [col for col in full_cols if col in stock_universe.columns]
+                st.dataframe(format_analysis_df(stock_universe[full_cols]), use_container_width=True, hide_index=True)
 
             st.subheader(f"篩選結果：{len(selected)} 檔股票入選（上限 {int(max_stocks)} 檔）")
             if selected.empty:
-                st.warning("目前篩選條件過嚴，無股票符合。請嘗試放寬左側條件。")
+                st.warning("目前沒有股票同時符合報告與策略交集。可以先查看上方檢核表，確認是三率/營收/法人文字沒抓到，或是成交量、市值、低基期門檻太嚴。")
             else:
-                cols = ["股票", "公司", "券商", "資料日期", "建議/推薦", "目前價", "目標價", "情境報酬", "歷史報酬", "波動", "最大回撤", "智慧分數", "權重"]
+                cols = [
+                    "股票", "公司", "券商", "資料日期", "建議/推薦", "目前價", "目標價", "情境報酬",
+                    "低基期位置", "營收特徵", "營收MoM", "累積YoY", "外資投信買超張數",
+                    "平均成交張數", "市值百萬元", "智慧分數", "權重",
+                ]
                 st.dataframe(format_analysis_df(selected[cols]), use_container_width=True, hide_index=True)
                 st.bar_chart(selected.set_index("股票")["智慧分數"])
 
