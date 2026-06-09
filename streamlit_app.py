@@ -1395,6 +1395,13 @@ def read_uploaded_csv(uploaded_file):
     return pd.DataFrame()
 
 
+def configured_finmind_password():
+    try:
+        return str(st.secrets.get("FINMIND_UPDATE_PASSWORD", "")).strip()
+    except Exception:
+        return ""
+
+
 def finmind_headers(token):
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -2310,11 +2317,24 @@ def render_stock_picker_page():
             if institutional_csv:
                 imported_institutional = save_institutional_to_db(read_uploaded_csv(institutional_csv), source="csv")
             st.cache_data.clear()
-            st.success(f"已匯入月營收 {imported_revenue:,} 筆、法人買賣 {imported_institutional:,} 筆")
+        st.success(f"已匯入月營收 {imported_revenue:,} 筆、法人買賣 {imported_institutional:,} 筆")
 
         st.header("🔎 智慧選股")
-        allow_finmind_update = st.checkbox("缺資料時用 FinMind 更新資料庫", value=False)
-        finmind_token = st.text_input("FinMind Token（可留空）", type="password", disabled=not allow_finmind_update, help="只有勾選更新資料庫時才會使用 FinMind；留空會嘗試公開額度。")
+        request_finmind_update = st.checkbox("缺資料時用 FinMind 更新資料庫", value=False)
+        finmind_password = ""
+        finmind_password_ok = False
+        configured_password = configured_finmind_password()
+        if request_finmind_update:
+            finmind_password = st.text_input("FinMind 使用密碼", type="password", help="需符合 Streamlit secrets 裡的 FINMIND_UPDATE_PASSWORD。")
+            if not configured_password:
+                st.warning("尚未設定 FINMIND_UPDATE_PASSWORD，FinMind 更新功能已停用。")
+            elif finmind_password == configured_password:
+                finmind_password_ok = True
+                st.success("FinMind 更新已解鎖。")
+            elif finmind_password:
+                st.warning("FinMind 使用密碼不正確，將只讀本機資料庫。")
+        allow_finmind_update = request_finmind_update and finmind_password_ok
+        finmind_token = st.text_input("FinMind Token（可留空）", type="password", disabled=not allow_finmind_update, help="只有勾選並輸入正確使用密碼後才會使用 FinMind；留空會嘗試公開額度。")
         apply_strategy = st.checkbox("套用策略交集", value=True)
         low_base_limit = st.slider("低基期位置上限 (%)", min_value=0.0, max_value=100.0, value=35.0, step=5.0, disabled=not apply_strategy)
         min_volume_lots = st.number_input("每日成交張數下限", min_value=0, max_value=100000, value=200, step=50, disabled=not apply_strategy)
@@ -2618,8 +2638,8 @@ def render_stock_picker_page():
                     """
                     1. **低基期**：用歷史區間內的收盤價位置計算，`(目前價 - 區間最低價) / (區間最高價 - 區間最低價) × 100`，低於左側設定門檻就通過。
                     2. **三率三升**：用 yfinance 季財報計算毛利率、營益率、淨利率，三者都比前一季上升就通過。
-                    3. **營收條件三選一**：用本機資料庫的月營收判斷 `月營收創高`、`月營收 MoM +10%`、`累積 YoY +10%` 任一項；資料可由 CSV 匯入，或勾選後用 FinMind 補缺漏。
-                    4. **法人買入**：用本機資料庫的法人買賣表計算最近可得交易日的 `外資 + 投信` 買超張數，大於 0 就通過；資料可由 CSV 匯入，或勾選後用 FinMind 補缺漏。
+                    3. **營收條件三選一**：用本機資料庫的月營收判斷 `月營收創高`、`月營收 MoM +10%`、`累積 YoY +10%` 任一項；資料可由 CSV 匯入，或勾選並輸入正確密碼後用 FinMind 補缺漏。
+                    4. **法人買入**：用本機資料庫的法人買賣表計算最近可得交易日的 `外資 + 投信` 買超張數，大於 0 就通過；資料可由 CSV 匯入，或勾選並輸入正確密碼後用 FinMind 補缺漏。
                     5. **成交量**：用最近 20 個交易日平均成交股數換算成張數，門檻預設 200 張。
                     6. **市值**：用 yfinance 的 marketCap 換算成百萬元，門檻預設 200,000 百萬元。
                     """
@@ -2653,9 +2673,10 @@ def render_stock_picker_page():
                 st.bar_chart(selected.set_index("股票")["智慧分數"])
 
 
-init_tab_state()
-st.session_state.setdefault("auto_rows", [])
-st.session_state.setdefault("auto_pending", [])
-st.session_state.setdefault("auto_processed_files", set())
+if __name__ == "__main__":
+    init_tab_state()
+    st.session_state.setdefault("auto_rows", [])
+    st.session_state.setdefault("auto_pending", [])
+    st.session_state.setdefault("auto_processed_files", set())
 
-render_stock_picker_page()
+    render_stock_picker_page()
