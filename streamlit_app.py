@@ -4,6 +4,7 @@ import random
 import sqlite3
 from io import BytesIO
 from datetime import datetime
+from pathlib import Path
 
 import fitz
 import pandas as pd
@@ -16,6 +17,7 @@ import yfinance as yf
 st.set_page_config(page_title="股票報表系統", layout="wide", initial_sidebar_state="expanded")
 
 DB_PATH = "stock_data.db"
+BROKER_DB_PATH = "broker_reports.db"
 
 
 def apply_app_style():
@@ -1395,6 +1397,56 @@ def read_uploaded_csv(uploaded_file):
     return pd.DataFrame()
 
 
+def broker_database_counts():
+    if not Path(BROKER_DB_PATH).exists():
+        return 0, 0
+    try:
+        with sqlite3.connect(BROKER_DB_PATH) as conn:
+            files = conn.execute("SELECT COUNT(*) FROM broker_files").fetchone()[0]
+            reports = conn.execute("SELECT COUNT(*) FROM broker_reports").fetchone()[0]
+        return files, reports
+    except Exception:
+        return 0, 0
+
+
+def load_broker_database_rows():
+    if not Path(BROKER_DB_PATH).exists():
+        return []
+    try:
+        with sqlite3.connect(BROKER_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT file_name, file_path, stock, company, broker, report_date,
+                       rating, target_price, reason, raw_text, parse_status
+                FROM broker_reports
+                ORDER BY report_date DESC, stock, broker, file_name
+                """,
+                conn,
+            )
+    except Exception:
+        return []
+
+    rows = []
+    for _, item in df.iterrows():
+        rows.append({
+            "檔名": item.get("file_name") or "",
+            "檔案路徑": item.get("file_path") or "",
+            "股票": str(item.get("stock") or ""),
+            "公司": item.get("company") or "-",
+            "券商": item.get("broker") or "-",
+            "資料日期": item.get("report_date") or "-",
+            "建議/推薦": item.get("rating") or "",
+            "目前價": None,
+            "目標價": item.get("target_price"),
+            "漲幅": None,
+            "狀態": "資料庫",
+            "備註": item.get("parse_status") or "",
+            "原文": item.get("raw_text") or "",
+            "評價原因": item.get("reason") or "",
+        })
+    return rows
+
+
 def configured_finmind_password():
     try:
         return str(st.secrets.get("FINMIND_UPDATE_PASSWORD", "")).strip()
@@ -2358,13 +2410,14 @@ def broker_reason_df(related_reports):
     if related_reports.empty:
         return pd.DataFrame()
     for _, item in related_reports.iterrows():
+        stored_reason = str(item.get("評價原因") or "").strip()
         rows.append({
             "資料日期": item.get("資料日期", "-"),
             "券商": item.get("券商", "-"),
             "評等": item.get("建議/推薦", "-") or "-",
             "目標價": item.get("目標價"),
             "潛在漲幅": item.get("漲幅"),
-            "評價原因": extract_broker_reason(
+            "評價原因": stored_reason or extract_broker_reason(
                 item.get("原文", ""),
                 item.get("股票", ""),
                 item.get("建議/推薦", ""),
@@ -2405,10 +2458,17 @@ def render_broker_report_analysis_app():
     st.title("📈 券商研究報告分析工具")
     st.caption("上傳券商 PDF 研究報告，自動擷取股票、券商、評等、目標價與報告日期，彙整成可比較的分析表。")
 
-    base_rows = st.session_state.get("auto_rows", [])
-    brokers = sorted({row.get("券商", "-") for row in base_rows + SAMPLE_ROWS if row.get("券商")})
+    uploaded_rows = st.session_state.get("auto_rows", [])
+    database_rows = load_broker_database_rows()
+    brokers = sorted({row.get("券商", "-") for row in uploaded_rows + database_rows + SAMPLE_ROWS if row.get("券商")})
 
     with st.sidebar:
+        st.header("🗄️ 券商資料庫")
+        db_files, db_reports = broker_database_counts()
+        st.caption(f"檔案 {db_files:,} 個；報告 {db_reports:,} 筆")
+        use_broker_database = st.checkbox("載入券商資料庫", value=True, disabled=db_reports == 0)
+        st.divider()
+
         st.header("📁 上傳報告")
         uploads = st.file_uploader(
             "上傳券商研究報告 PDF",
@@ -2445,10 +2505,11 @@ def render_broker_report_analysis_app():
         forecast_days = st.slider("預測天數", min_value=1, max_value=365, value=90, step=5)
         recent_only = st.checkbox("只看近期報告", value=False)
         recent_days = st.number_input("近期報告天數", min_value=1, max_value=365, value=90, step=5, disabled=not recent_only)
-        use_sample = st.checkbox("使用範例資料", value=not bool(base_rows))
+        use_sample = st.checkbox("使用範例資料", value=not bool(uploaded_rows or database_rows))
         stock_filter = st.text_input("篩選股票代碼", placeholder="例如 2308, 6805")
         broker_filter = st.multiselect("篩選券商", brokers)
 
+    base_rows = (database_rows if use_broker_database else []) + uploaded_rows
     pending_rows = pending_report_rows()
     all_report_universe = build_selection_universe(
         base_rows + pending_rows,
