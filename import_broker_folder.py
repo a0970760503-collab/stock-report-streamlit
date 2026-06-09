@@ -189,11 +189,12 @@ def reason_from_text(text):
 def init_db(conn):
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS broker_files (
-            file_id TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            relative_path TEXT NOT NULL,
-            filename TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS broker_files (
+                file_id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                filename TEXT NOT NULL,
             extension TEXT NOT NULL,
             size INTEGER,
             modified_at TEXT
@@ -219,6 +220,9 @@ def init_db(conn):
         )
         """
     )
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(broker_files)").fetchall()]
+    if "content_hash" not in columns:
+        conn.execute("ALTER TABLE broker_files ADD COLUMN content_hash TEXT")
 
 
 def main():
@@ -269,10 +273,10 @@ def main():
             conn.execute(
                 """
                 INSERT INTO broker_files
-                    (file_id, path, relative_path, filename, extension, size, modified_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (file_id, content_hash, path, relative_path, filename, extension, size, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (file_id, str(path), rel_path, filename, extension, stat.st_size, modified_at),
+                (file_id, content_hash, str(path), rel_path, filename, extension, stat.st_size, modified_at),
             )
             conn.execute(
                 """

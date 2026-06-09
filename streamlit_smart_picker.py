@@ -1,3 +1,5 @@
+import html
+
 import pandas as pd
 import streamlit as st
 
@@ -72,6 +74,418 @@ def render_strategy_explanation():
             6. **市值**：用 yfinance 的 marketCap 換算成百萬元。
             """
         )
+
+
+def smart_num(value, default=0.0):
+    parsed = core.number(value)
+    if parsed is None or pd.isna(parsed):
+        return default
+    return float(parsed)
+
+
+def smart_text(value, default="-"):
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def smart_pct_text(value, digits=1):
+    parsed = core.number(value)
+    if parsed is None or pd.isna(parsed):
+        return "-"
+    return f"{parsed:.{digits}f}%"
+
+
+def smart_stage(row):
+    score = smart_num(row.get("智慧分數"))
+    strategy_pass = bool(row.get("策略通過"))
+    low_base = bool(row.get("低基期"))
+    revenue = bool(row.get("營收條件"))
+    institutional = bool(row.get("法人買入"))
+    if strategy_pass or (score >= 90 and revenue and institutional):
+        return "Stage 2 — 主升段", "stage-hot"
+    if score >= 60 or low_base:
+        return "Stage 1 — 潛伏段", "stage-base"
+    if smart_num(row.get("情境報酬")) < 0 or score < 20:
+        return "Watch — 風險觀察", "stage-risk"
+    return "Stage 0 — 觀察池", "stage-watch"
+
+
+def smart_badge(text, kind="neutral"):
+    return f'<span class="smart-badge {kind}">{html.escape(str(text))}</span>'
+
+
+def smart_signal_badges(row):
+    badges = []
+    if bool(row.get("低基期")):
+        badges.append(smart_badge(f"低基期 {smart_pct_text(row.get('低基期位置'), 0)}", "gold"))
+    if bool(row.get("三率三升")):
+        badges.append(smart_badge("三率三升", "blue"))
+    if bool(row.get("營收條件")):
+        badges.append(smart_badge(smart_text(row.get("營收特徵"), "營收條件"), "green"))
+    if bool(row.get("法人買入")):
+        lots = smart_num(row.get("外資投信買超張數"))
+        badges.append(smart_badge(f"法人買超 {lots:,.0f} 張", "cyan"))
+    upside = smart_num(row.get("情境報酬"), None)
+    if upside is not None:
+        badges.append(smart_badge(f"情境報酬 {upside:+.1f}%", "purple" if upside >= 0 else "red"))
+    if not badges:
+        badges.append(smart_badge("資料待補", "neutral"))
+    return "".join(badges)
+
+
+def smart_rating_stars(row):
+    score = core.rating_score(row.get("建議/推薦"))
+    stars = max(1, min(3, int(round(max(score, 0) / 7)) or 1))
+    return "★" * stars + "☆" * (3 - stars)
+
+
+def smart_table_html(df):
+    if df.empty:
+        return ""
+    max_score = max(100.0, float(df["智慧分數"].fillna(0).max()) if "智慧分數" in df else 100.0)
+    rows = []
+    for rank, (_, row) in enumerate(df.iterrows(), start=1):
+        stage_label, stage_class = smart_stage(row)
+        score = smart_num(row.get("智慧分數"))
+        score_width = max(4, min(100, score / max_score * 100))
+        code = html.escape(smart_text(row.get("股票")))
+        company = html.escape(smart_text(row.get("公司")))
+        broker = html.escape(smart_text(row.get("券商")))
+        price = smart_num(row.get("目前價"), None)
+        price_text = "-" if price is None else f"{price:,.2f}"
+        score_delta = smart_pct_text(row.get("情境報酬"))
+        target = smart_num(row.get("目標價"), None)
+        target_text = "-" if target is None else f"{target:,.2f}"
+        low_base = smart_pct_text(row.get("低基期位置"), 0)
+        volume = smart_num(row.get("平均成交張數"), None)
+        volume_text = "-" if volume is None else f"{volume:,.0f}"
+        rows.append(
+            f"""
+            <tr>
+                <td class="rank">{rank}</td>
+                <td>
+                    <div class="stock-code">{code}</div>
+                    <div class="stock-name">{company}</div>
+                </td>
+                <td class="price">{price_text}</td>
+                <td><span class="stage-pill {stage_class}">{html.escape(stage_label)}</span></td>
+                <td class="signals">{smart_signal_badges(row)}</td>
+                <td>
+                    <div class="score-wrap">
+                        <strong>{score:.0f}</strong>
+                        <span>{score_delta}</span>
+                    </div>
+                    <div class="score-bar"><i style="width:{score_width:.0f}%"></i></div>
+                </td>
+                <td>
+                    <div class="stars">{smart_rating_stars(row)}</div>
+                    <div class="rating-text">{html.escape(smart_text(row.get("建議/推薦"), "未評"))}</div>
+                </td>
+                <td>{target_text}</td>
+                <td>{low_base}</td>
+                <td>{volume_text}</td>
+                <td class="broker">{broker}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <div class="smart-table-shell">
+        <table class="smart-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>股票</th>
+                    <th>現價</th>
+                    <th>Weinstein 階段</th>
+                    <th>觸發訊號</th>
+                    <th>評分</th>
+                    <th>評級</th>
+                    <th>目標價</th>
+                    <th>低基期</th>
+                    <th>量能</th>
+                    <th>券商</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+    </div>
+    """
+
+
+def render_smart_dashboard(stock_universe, selected, max_stocks):
+    st.markdown(
+        """
+        <style>
+        .smart-lab {
+            padding: 18px 20px;
+            border: 1px solid rgba(0, 209, 255, .28);
+            border-radius: 10px;
+            background:
+                radial-gradient(circle at 50% -30%, rgba(0, 209, 255, .18), transparent 34%),
+                linear-gradient(135deg, #061426 0%, #020810 62%, #030f14 100%);
+            color: #dff8ff;
+            box-shadow: inset 0 0 0 1px rgba(0, 255, 195, .08);
+        }
+        .smart-lab-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 18px;
+            font-weight: 700;
+        }
+        .market-dot {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 10px;
+            background: #18ffc2;
+            box-shadow: 0 0 16px #18ffc2;
+        }
+        .market-note {
+            color: #00ffc8;
+            background: rgba(0, 255, 153, .10);
+            border: 1px solid rgba(0, 255, 153, .18);
+            border-radius: 6px;
+            padding: 7px 12px;
+        }
+        .smart-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .smart-stat {
+            padding: 17px 20px;
+            border: 1px solid rgba(0, 178, 255, .28);
+            border-radius: 10px;
+            background: rgba(8, 26, 58, .92);
+        }
+        .smart-stat strong {
+            display: block;
+            color: #00d9ff;
+            font-size: 2rem;
+            line-height: 1;
+        }
+        .smart-stat span {
+            display: block;
+            margin-top: 8px;
+            color: #67a6c7;
+            font-size: .9rem;
+        }
+        .smart-table-shell {
+            overflow-x: auto;
+            border: 1px solid rgba(0, 185, 255, .28);
+            border-radius: 8px;
+            background:
+                radial-gradient(circle at 88% 12%, rgba(0, 209, 255, .12), transparent 22%),
+                #020a12;
+        }
+        .smart-table {
+            width: 100%;
+            min-width: 1120px;
+            border-collapse: collapse;
+            color: #d9f7ff;
+            font-size: .94rem;
+        }
+        .smart-table th {
+            text-align: left;
+            color: #79c7ec;
+            padding: 13px 16px;
+            border-bottom: 1px solid rgba(0, 209, 255, .45);
+            background: rgba(8, 31, 66, .94);
+            font-size: .78rem;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+        .smart-table td {
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(85, 166, 211, .12);
+            vertical-align: middle;
+        }
+        .smart-table tr:hover td {
+            background: rgba(0, 209, 255, .045);
+        }
+        .rank, .broker, .rating-text { color: #6fa8c7; }
+        .stock-code {
+            color: #dff8ff;
+            font-weight: 800;
+            font-size: 1.02rem;
+        }
+        .stock-name {
+            color: #7db6d5;
+            margin-top: 3px;
+            white-space: nowrap;
+        }
+        .price {
+            color: #dff8ff;
+            font-weight: 800;
+        }
+        .stage-pill, .smart-badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            padding: 3px 9px;
+            margin: 2px 4px 2px 0;
+            border-radius: 999px;
+            font-weight: 800;
+            font-size: .78rem;
+            white-space: nowrap;
+        }
+        .stage-hot, .gold {
+            color: #ffd84a;
+            border: 1px solid rgba(255, 216, 74, .58);
+            background: rgba(255, 216, 74, .12);
+        }
+        .stage-base, .green {
+            color: #16ffc4;
+            border: 1px solid rgba(22, 255, 196, .34);
+            background: rgba(22, 255, 196, .10);
+        }
+        .stage-watch, .blue, .cyan {
+            color: #7bdcff;
+            border: 1px solid rgba(123, 220, 255, .30);
+            background: rgba(0, 145, 255, .12);
+        }
+        .stage-risk, .red {
+            color: #ff6b8a;
+            border: 1px solid rgba(255, 107, 138, .32);
+            background: rgba(255, 107, 138, .12);
+        }
+        .purple {
+            color: #d5a6ff;
+            border: 1px solid rgba(213, 166, 255, .30);
+            background: rgba(151, 88, 255, .15);
+        }
+        .neutral {
+            color: #9bb9ca;
+            border: 1px solid rgba(155, 185, 202, .25);
+            background: rgba(155, 185, 202, .10);
+        }
+        .score-wrap {
+            display: flex;
+            gap: 10px;
+            align-items: baseline;
+            color: #ffd84a;
+        }
+        .score-wrap strong { font-size: 1.25rem; }
+        .score-wrap span {
+            color: #ff5c93;
+            font-size: .82rem;
+        }
+        .score-bar {
+            width: 112px;
+            height: 5px;
+            margin-top: 8px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(76, 129, 172, .28);
+        }
+        .score-bar i {
+            display: block;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #ffe45e, #00e5ff);
+        }
+        .stars {
+            color: #ffd84a;
+            letter-spacing: 0;
+            white-space: nowrap;
+        }
+        @media (max-width: 900px) {
+            .smart-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .smart-lab-top { align-items: flex-start; flex-direction: column; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    universe = stock_universe.copy()
+    universe["_stage"] = universe.apply(lambda row: smart_stage(row)[0], axis=1)
+    universe["_score"] = universe["智慧分數"].fillna(0) if "智慧分數" in universe else 0
+    stage2_count = int((universe["_stage"] == "Stage 2 — 主升段").sum())
+    strategy_count = int(universe["策略通過"].fillna(False).sum()) if "策略通過" in universe else 0
+    highest_score = smart_num(universe["智慧分數"].max()) if "智慧分數" in universe else 0
+    avg_return = universe["情境報酬"].dropna().mean() if "情境報酬" in universe else None
+    avg_return_text = "-" if avg_return is None or pd.isna(avg_return) else f"{avg_return:.1f}%"
+
+    st.markdown(
+        f"""
+        <div class="smart-lab">
+            <div class="smart-lab-top">
+                <div><span class="market-dot"></span>智慧選股作戰台&nbsp;&nbsp; <strong>Stage 2 — 主升段</strong>&nbsp;&nbsp; 報告池 {len(universe):,} | 平均情境報酬 {avg_return_text}</div>
+                <div class="market-note">策略交集越完整，訊號可信度越高</div>
+            </div>
+            <div class="smart-stat-grid">
+                <div class="smart-stat"><strong>{len(universe):,}</strong><span>股票池</span></div>
+                <div class="smart-stat"><strong>{strategy_count:,}</strong><span>策略通過</span></div>
+                <div class="smart-stat"><strong>{highest_score:.0f}</strong><span>最高評分</span></div>
+                <div class="smart-stat"><strong>{stage2_count:,}</strong><span>Stage 2 主升段</span></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    pool = st.radio("股票池", ["精選池", "全市場", "預警池"], horizontal=True, label_visibility="collapsed")
+    max_display = max(5, min(50, len(universe)))
+    default_display = min(max_display, max(10, int(max_stocks)))
+    c1, c2, c3 = st.columns([1, 1.25, 1.25])
+    with c1:
+        show_count = st.slider("顯示前", min_value=5, max_value=max_display, value=default_display, step=1)
+    with c2:
+        stage_filter = st.selectbox("篩選", ["全部階段"] + sorted(universe["_stage"].dropna().unique().tolist()))
+    with c3:
+        sort_mode = st.selectbox("排序", ["依評分排序", "依情境報酬排序", "依低基期排序", "依報告數排序"])
+
+    if pool == "精選池":
+        frame = selected.copy()
+    elif pool == "預警池":
+        strategy_mask = universe["策略通過"].fillna(False) if "策略通過" in universe else pd.Series(False, index=universe.index)
+        frame = universe[(~strategy_mask) | (universe["_score"] < 40)].copy()
+    else:
+        frame = universe.copy()
+
+    if not frame.empty:
+        frame["_stage"] = frame.apply(lambda row: smart_stage(row)[0], axis=1)
+        if stage_filter != "全部階段":
+            frame = frame[frame["_stage"] == stage_filter]
+
+    sort_columns = {
+        "依評分排序": ("智慧分數", False),
+        "依情境報酬排序": ("情境報酬", False),
+        "依低基期排序": ("低基期位置", True),
+        "依報告數排序": ("報告筆數", False),
+    }
+    sort_col, ascending = sort_columns[sort_mode]
+    if sort_col in frame:
+        frame = frame.sort_values(sort_col, ascending=ascending, na_position="last")
+    frame = frame.head(show_count)
+
+    if frame.empty:
+        if pool == "精選池":
+            st.warning("目前沒有股票同時符合報告與策略交集。可以切到「全市場」看候選池，或放寬左側低基期、成交量、市值與策略交集條件。")
+        else:
+            st.info("目前這個池別沒有符合條件的股票。")
+    else:
+        st.markdown(smart_table_html(frame), unsafe_allow_html=True)
+
+    with st.expander("策略檢核明細", expanded=False):
+        feature_cols = [
+            "股票", "公司", "券商", "報告筆數", "目前價", "情境報酬", "建議/推薦", "目標價",
+            "低基期位置", "低基期", "三率三升", "營收條件", "營收特徵", "法人買入",
+            "營收MoM", "累積YoY", "外資投信買超張數", "平均成交張數", "市值百萬元",
+            "策略通過", "三率原因", "營收原因", "法人原因", "策略資料來源", "智慧分數",
+        ]
+        feature_cols = [col for col in feature_cols if col in stock_universe.columns]
+        st.dataframe(core.format_analysis_df(stock_universe[feature_cols]), use_container_width=True, hide_index=True)
+
+    with st.expander("策略條件說明", expanded=False):
+        render_strategy_explanation()
 
 
 def render_smart_picker():
@@ -181,32 +595,7 @@ def render_smart_picker():
         st.info("尚無候選股票。請先上傳報告，或勾選使用範例資料。")
         return
 
-    render_strategy_explanation()
-
-    feature_cols = [
-        "股票", "公司", "券商", "報告筆數", "目前價", "情境報酬", "建議/推薦", "目標價",
-        "低基期位置", "低基期", "三率三升", "營收條件", "營收特徵", "法人買入",
-        "營收MoM", "累積YoY", "外資投信買超張數", "平均成交張數", "市值百萬元",
-        "策略通過", "三率原因", "營收原因", "法人原因", "策略資料來源", "智慧分數",
-    ]
-    feature_cols = [col for col in feature_cols if col in stock_universe.columns]
-
-    with st.expander("各股策略檢核表", expanded=True):
-        st.dataframe(core.format_analysis_df(stock_universe[feature_cols]), use_container_width=True, hide_index=True)
-
-    st.subheader(f"篩選結果：{len(selected)} 檔股票入選（上限 {int(max_stocks)} 檔）")
-    if selected.empty:
-        st.warning("目前沒有股票同時符合報告與策略交集。可查看上方檢核表，或放寬左側條件。")
-        return
-
-    result_cols = [
-        "股票", "公司", "券商", "資料日期", "建議/推薦", "目前價", "目標價", "情境報酬",
-        "低基期位置", "營收特徵", "營收MoM", "累積YoY", "外資投信買超張數",
-        "平均成交張數", "市值百萬元", "智慧分數", "權重",
-    ]
-    result_cols = [col for col in result_cols if col in selected.columns]
-    st.dataframe(core.format_analysis_df(selected[result_cols]), use_container_width=True, hide_index=True)
-    st.bar_chart(selected.set_index("股票")["智慧分數"])
+    render_smart_dashboard(stock_universe, selected, max_stocks)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,16 @@
-import re
+﻿import re
 import math
+import os
 import random
 import sqlite3
+import hashlib
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
 
 import fitz
 import pandas as pd
@@ -16,8 +22,9 @@ import yfinance as yf
 
 st.set_page_config(page_title="股票報表系統", layout="wide", initial_sidebar_state="expanded")
 
-DB_PATH = "stock_data.db"
-BROKER_DB_PATH = "broker_reports.db"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "stock_data.db"
+BROKER_DB_PATH = BASE_DIR / "broker_reports.db"
 
 
 def apply_app_style():
@@ -1397,7 +1404,57 @@ def read_uploaded_csv(uploaded_file):
     return pd.DataFrame()
 
 
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def broker_upload_file_id(file_name, content_hash):
+    key = f"{content_hash}:{file_name}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(key).hexdigest()
+
+
+def init_broker_database():
+    with sqlite3.connect(BROKER_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_files (
+                file_id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                extension TEXT NOT NULL,
+                size INTEGER,
+                modified_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_reports (
+                file_id TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                stock TEXT,
+                company TEXT,
+                broker TEXT,
+                report_date TEXT,
+                rating TEXT,
+                target_price REAL,
+                reason TEXT,
+                raw_text TEXT,
+                parse_status TEXT,
+                imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(broker_files)").fetchall()]
+        if "content_hash" not in columns:
+            conn.execute("ALTER TABLE broker_files ADD COLUMN content_hash TEXT")
+
+
 def broker_database_counts():
+    init_broker_database()
     if not Path(BROKER_DB_PATH).exists():
         return 0, 0
     try:
@@ -1410,6 +1467,7 @@ def broker_database_counts():
 
 
 def load_broker_database_rows():
+    init_broker_database()
     if not Path(BROKER_DB_PATH).exists():
         return []
     try:
@@ -1447,11 +1505,151 @@ def load_broker_database_rows():
     return rows
 
 
+def broker_file_exists(content_hash):
+    init_broker_database()
+    with sqlite3.connect(BROKER_DB_PATH) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM broker_files WHERE content_hash = ?",
+            (content_hash,),
+        ).fetchone()[0]
+    return count > 0
+
+
+def save_uploaded_broker_reports(uploaded_file, parsed_items):
+    init_broker_database()
+    data = uploaded_file.getvalue()
+    content_hash = sha256_bytes(data)
+    if broker_file_exists(content_hash):
+        return False
+
+    file_id = broker_upload_file_id(uploaded_file.name, content_hash)
+    size = len(data)
+    extension = Path(uploaded_file.name).suffix.lower()
+    imported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if isinstance(parsed_items, dict):
+        parsed_items = [parsed_items]
+    parsed_items = parsed_items or []
+
+    first = parsed_items[0] if parsed_items else {}
+    raw_text = "\n\n".join(str(item.get("raw_text") or "") for item in parsed_items)[:50000]
+    reason = ""
+    if parsed_items:
+        reason = extract_broker_reason(
+            parsed_items[0].get("raw_text", ""),
+            parsed_items[0].get("stock", ""),
+            parsed_items[0].get("rating", ""),
+            parsed_items[0].get("target"),
+        )
+
+    with sqlite3.connect(BROKER_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO broker_files
+                (file_id, content_hash, path, relative_path, filename, extension, size, modified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (file_id, content_hash, f"uploaded:{uploaded_file.name}", uploaded_file.name, uploaded_file.name, extension, size, imported_at),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO broker_reports
+                (file_id, file_name, file_path, stock, company, broker, report_date, rating,
+                 target_price, reason, raw_text, parse_status, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                file_id,
+                uploaded_file.name,
+                f"uploaded:{uploaded_file.name}",
+                first.get("stock", ""),
+                "",
+                first.get("broker", "-") or "-",
+                first.get("date", "-") or "-",
+                first.get("rating", ""),
+                first.get("target"),
+                reason,
+                raw_text,
+                "uploaded_parsed",
+            ),
+        )
+    return True
+
+
+def process_broker_uploads_to_database(files):
+    imported = 0
+    skipped = 0
+    pending = 0
+    rows_added = 0
+
+    for uploaded_file in files:
+        data = uploaded_file.getvalue()
+        content_hash = sha256_bytes(data)
+        if broker_file_exists(content_hash):
+            skipped += 1
+            continue
+
+        parsed_items = parse_reports(uploaded_file)
+        if isinstance(parsed_items, dict):
+            parsed_items = [parsed_items]
+
+        if save_uploaded_broker_reports(uploaded_file, parsed_items):
+            imported += 1
+        else:
+            skipped += 1
+            continue
+
+        for parsed in parsed_items:
+            quote = fetch_quote(parsed["stock"]) if parsed.get("stock") else {"price": None, "name": "", "symbol": ""}
+            if parsed.get("stock") and quote["price"]:
+                if add_row_to(
+                    "auto_rows",
+                    parsed["stock"],
+                    quote["name"],
+                    parsed.get("broker"),
+                    parsed.get("date"),
+                    quote["price"],
+                    parsed.get("target"),
+                    parsed.get("rating", ""),
+                    parsed.get("file_name", uploaded_file.name),
+                    parsed.get("raw_text", ""),
+                ):
+                    rows_added += 1
+            else:
+                parsed["reason"] = "Yahoo Finance 抓不到現價或股票代碼不足"
+                st.session_state.auto_pending.append(parsed)
+                pending += 1
+
+    st.cache_data.clear()
+    return imported, rows_added, pending, skipped
+
+
 def configured_finmind_password():
+    env_password = os.getenv("FINMIND_UPDATE_PASSWORD", "").strip()
+    if env_password:
+        return env_password
+
     try:
-        return str(st.secrets.get("FINMIND_UPDATE_PASSWORD", "")).strip()
+        secrets_password = str(st.secrets.get("FINMIND_UPDATE_PASSWORD", "")).strip()
+        if secrets_password:
+            return secrets_password
+    except Exception:
+        pass
+
+    secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    try:
+        if tomllib is not None:
+            with secrets_path.open("rb") as secrets_file:
+                return str(tomllib.load(secrets_file).get("FINMIND_UPDATE_PASSWORD", "")).strip()
+
+        for line in secrets_path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r'\s*FINMIND_UPDATE_PASSWORD\s*=\s*["\']?([^"\']+)["\']?\s*$', line)
+            if match:
+                return match.group(1).strip()
     except Exception:
         return ""
+
+    return ""
 
 
 def finmind_headers(token):
@@ -2481,14 +2679,8 @@ def render_broker_report_analysis_app():
                 st.session_state.auto_rows = []
                 st.session_state.auto_pending = []
                 st.session_state.auto_processed_files = set()
-                added, pending, skipped = process_tab_uploads(
-                    uploads,
-                    "auto_rows",
-                    "auto_pending",
-                    "auto_processed_files",
-                    parse_reports,
-                )
-                st.success(f"已加入 {added} 筆，待確認 {pending} 筆，重複略過 {skipped} 筆")
+                imported, rows_added, pending, skipped = process_broker_uploads_to_database(uploads)
+                st.success(f"已入庫 {imported} 個檔案，加入畫面 {rows_added} 筆，待確認 {pending} 筆，重複略過 {skipped} 個檔案")
             else:
                 st.warning("請先選擇 PDF")
 
