@@ -2265,6 +2265,33 @@ def broker_summary_df(report_df):
     return pd.DataFrame(rows).sort_values(["報告數", "平均潛在漲幅"], ascending=[False, False])
 
 
+def broker_portfolio_universe(report_df, history_days):
+    summary = report_stock_summary_df(report_df)
+    if summary.empty:
+        return pd.DataFrame()
+
+    result = summary.rename(
+        columns={
+            "平均目標價": "目標價",
+            "平均潛在漲幅": "漲幅",
+        }
+    ).copy()
+    result["情境目標價"] = result["目標價"]
+    result["智慧分數"] = result["情境報酬"].fillna(0) + result["報告數"].fillna(0) * 0.8
+
+    metrics = []
+    for _, row in result.iterrows():
+        item = history_metrics(row["股票"], history_days)
+        metrics.append({
+            "歷史報酬": item["歷史報酬"],
+            "波動": item["波動"],
+            "最大回撤": item["最大回撤"],
+        })
+    metric_df = pd.DataFrame(metrics, index=result.index)
+    result = pd.concat([result.reset_index(drop=True), metric_df.reset_index(drop=True)], axis=1)
+    return result
+
+
 def render_broker_report_analysis_app():
     st.title("📈 券商研究報告分析工具")
     st.caption("上傳券商 PDF 研究報告，自動擷取股票、券商、評等、目標價與報告日期，彙整成可比較的分析表。")
@@ -2306,6 +2333,7 @@ def render_broker_report_analysis_app():
         st.header("📊 分析設定")
         scenario = st.selectbox("情境選擇", ["中性", "樂觀", "悲觀"], index=0, help="樂觀：目標價完全實現；中性：85%；悲觀：65%")
         history_days = st.slider("歷史資料天數", min_value=20, max_value=1200, value=365, step=5)
+        forecast_days = st.slider("預測天數", min_value=1, max_value=365, value=90, step=5)
         recent_only = st.checkbox("只看近期報告", value=False)
         recent_days = st.number_input("近期報告天數", min_value=1, max_value=365, value=90, step=5, disabled=not recent_only)
         use_sample = st.checkbox("使用範例資料", value=not bool(base_rows))
@@ -2334,7 +2362,16 @@ def render_broker_report_analysis_app():
         scenario,
     )
 
-    overview_tab, stock_tab, broker_tab, pending_tab = st.tabs(["📋 報告總覽", "📌 個股彙整", "🏦 券商觀點", "📝 待確認"])
+    portfolio_universe = broker_portfolio_universe(report_universe, history_days)
+
+    overview_tab, stock_tab, detail_tab, portfolio_tab, broker_tab, pending_tab = st.tabs([
+        "📋 報告總覽",
+        "📌 個股彙整",
+        "🔍 個股分析",
+        "📦 投資組合",
+        "🏦 券商觀點",
+        "📝 待確認",
+    ])
 
     with overview_tab:
         overview = report_overview_df(all_report_universe)
@@ -2373,6 +2410,120 @@ def render_broker_report_analysis_app():
             if not upside.empty:
                 st.subheader("平均潛在漲幅排名")
                 st.bar_chart(upside.head(20))
+
+    with detail_tab:
+        if portfolio_universe.empty:
+            st.info("尚無可分析的個股資料。")
+        else:
+            choices = [f"{row['股票']} / {row.get('公司', '-')}" for _, row in portfolio_universe.iterrows()]
+            selected_label = st.selectbox("選擇個股", choices, key="broker_detail_stock")
+            stock_code = selected_label.split("/")[0].strip()
+            row = portfolio_universe[portfolio_universe["股票"].astype(str) == stock_code].iloc[0]
+            related_reports = report_universe[report_universe["股票"].astype(str) == stock_code]
+
+            st.markdown(f"### {tw_symbol(stock_code)} {row.get('公司', '')}")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("目前價", format_num(row.get("目前價")) or "—")
+            k2.metric("平均目標價", format_num(row.get("目標價")) or "—")
+            k3.metric("平均潛在漲幅", "" if pd.isna(row.get("漲幅")) else f"{row.get('漲幅'):.1f}%")
+            k4.metric("報告數", int(row.get("報告數", 0)))
+
+            left, right = st.columns([1.1, 1.6])
+            with left:
+                st.subheader("報告明細")
+                detail_cols = ["資料日期", "券商", "建議/推薦", "目前價", "目標價", "漲幅", "情境報酬"]
+                detail_cols = [col for col in detail_cols if col in related_reports.columns]
+                st.dataframe(format_analysis_df(related_reports[detail_cols]), use_container_width=True, hide_index=True)
+            with right:
+                hist = analysis_history(row, history_days)
+                forecast = forecast_history(row, hist, forecast_days, scenario)
+                trend = pd.concat([hist.rename(columns={"收盤價": "歷史股價"}), forecast], axis=1)
+                st.subheader("歷史與目標推估")
+                st.line_chart(trend)
+
+            returns = daily_returns(analysis_history(row, history_days))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("歷史報酬", "" if pd.isna(row.get("歷史報酬")) else f"{row.get('歷史報酬'):.1f}%")
+            c2.metric("年化波動", "" if pd.isna(row.get("波動")) else f"{row.get('波動'):.1f}%")
+            c3.metric("最大回撤", "" if pd.isna(row.get("最大回撤")) else f"{row.get('最大回撤'):.1f}%")
+            if not returns.empty:
+                st.subheader("日報酬率")
+                st.bar_chart(returns.tail(90))
+
+    with portfolio_tab:
+        if portfolio_universe.empty:
+            st.info("尚無可建立投資組合的個股資料。")
+        else:
+            st.subheader("手動搭配投資組合")
+            options = portfolio_universe["股票"].astype(str).tolist()
+            default_options = options[: min(5, len(options))]
+            chosen_codes = st.multiselect("選擇納入投資組合的股票", options, default=default_options, key="broker_portfolio_codes")
+            portfolio_rows = portfolio_universe[portfolio_universe["股票"].astype(str).isin(chosen_codes)].copy()
+
+            if portfolio_rows.empty:
+                st.info("請至少選擇一檔股票。")
+            else:
+                st.subheader("調整權重")
+                equal_weight = int(round(100 / len(portfolio_rows))) if len(portfolio_rows) else 0
+                raw_weights = {}
+                cols = st.columns(min(3, len(portfolio_rows)))
+                for index, (_, item) in enumerate(portfolio_rows.iterrows()):
+                    stock = str(item["股票"])
+                    label = f"{tw_symbol(stock)} {item.get('公司', '-')}"
+                    raw_weights[stock] = cols[index % len(cols)].slider(
+                        label,
+                        min_value=0,
+                        max_value=100,
+                        value=equal_weight,
+                        step=1,
+                        key=f"broker_weight_{stock}",
+                    )
+
+                weight_total = sum(raw_weights.values())
+                if weight_total <= 0:
+                    normalized_weights = {str(row["股票"]): 100 / len(portfolio_rows) for _, row in portfolio_rows.iterrows()}
+                else:
+                    normalized_weights = {stock: value / weight_total * 100 for stock, value in raw_weights.items()}
+                portfolio_rows["權重"] = portfolio_rows["股票"].astype(str).map(normalized_weights).fillna(0)
+
+                current_returns, returns, names = current_portfolio_returns(portfolio_rows, history_days)
+                current_stats = portfolio_stats(returns, selected_weight_map(portfolio_rows))
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("年化報酬", f"{current_stats['年化報酬']:.1f}%")
+                m2.metric("年化波動", f"{current_stats['年化波動']:.1f}%")
+                m3.metric("夏普比率", f"{current_stats['夏普比率']:.2f}")
+                if abs(weight_total - 100) > 0.01:
+                    st.caption(f"滑桿合計 {weight_total:.0f}%，後續分析已自動換算為 100%。")
+
+                left, right = st.columns([1, 1.3])
+                with left:
+                    st.subheader("目前權重")
+                    labels = [f"{tw_symbol(row['股票'])} {row.get('公司', '-')}" for _, row in portfolio_rows.iterrows()]
+                    fig = go.Figure(
+                        data=[go.Pie(labels=labels, values=portfolio_rows["權重"].astype(float), hole=0.42, textinfo="label+percent", sort=False)]
+                    )
+                    fig.update_layout(height=420, margin=dict(l=8, r=8, t=12, b=12), showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                with right:
+                    st.subheader("組合明細")
+                    show_cols = ["股票", "公司", "目前價", "目標價", "漲幅", "情境報酬", "歷史報酬", "波動", "最大回撤", "權重"]
+                    show_cols = [col for col in show_cols if col in portfolio_rows.columns]
+                    st.dataframe(format_analysis_df(portfolio_rows[show_cols]), use_container_width=True, hide_index=True)
+
+                st.subheader("效率前緣")
+                frontier, _ = simulate_frontier(portfolio_rows, history_days)
+                if frontier.empty:
+                    st.info("歷史資料不足，無法建立效率前緣。")
+                else:
+                    st.plotly_chart(build_frontier_chart(frontier, current_stats), use_container_width=True)
+
+                st.subheader("累積報酬走勢")
+                cumulative = cumulative_return_table(portfolio_rows, history_days)
+                if cumulative.empty:
+                    st.info("沒有累積報酬資料。")
+                else:
+                    st.line_chart(cumulative)
 
     with broker_tab:
         broker_summary = broker_summary_df(report_universe)
