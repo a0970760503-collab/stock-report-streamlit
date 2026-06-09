@@ -2219,6 +2219,181 @@ def report_overview_df(universe):
     return df[["檔名", "股票代碼", "公司名稱", "報告發行日期", "券商", "評等", "目前股價", "目標股價", "潛在漲幅", "狀態", "備註", "近期報告"]]
 
 
+def report_stock_summary_df(report_df):
+    if report_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for stock, group in report_df.groupby("股票", sort=False):
+        latest_date = group["資料日期_dt"].dropna().max()
+        latest_date_text = latest_date.strftime("%Y/%m/%d") if pd.notna(latest_date) else str(group["資料日期"].dropna().iloc[-1] if group["資料日期"].notna().any() else "-")
+        current_values = group["目前價"].dropna()
+        target_values = group["目標價"].dropna()
+        rows.append({
+            "股票": str(stock),
+            "公司": group["公司"].replace("", "-").dropna().iloc[-1] if group["公司"].notna().any() else "-",
+            "最新報告日": latest_date_text,
+            "報告數": len(group),
+            "券商數": group["券商"].replace("", "-").nunique(),
+            "券商": " / ".join(sorted({value for value in group["券商"].dropna().astype(str) if value and value != "-"})) or "-",
+            "評等": " / ".join(sorted({value for value in group["建議/推薦"].dropna().astype(str) if value})) or "-",
+            "目前價": float(current_values.iloc[-1]) if not current_values.empty else None,
+            "平均目標價": float(target_values.mean()) if not target_values.empty else None,
+            "最高目標價": float(target_values.max()) if not target_values.empty else None,
+            "平均潛在漲幅": group["漲幅"].dropna().mean() if group["漲幅"].notna().any() else None,
+            "情境報酬": group["情境報酬"].dropna().mean() if group["情境報酬"].notna().any() else None,
+        })
+
+    return pd.DataFrame(rows).sort_values(["平均潛在漲幅", "報告數"], ascending=[False, False])
+
+
+def broker_summary_df(report_df):
+    if report_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for broker, group in report_df.groupby("券商", sort=True):
+        rows.append({
+            "券商": broker or "-",
+            "報告數": len(group),
+            "覆蓋股票數": group["股票"].nunique(),
+            "平均潛在漲幅": group["漲幅"].dropna().mean() if group["漲幅"].notna().any() else None,
+            "平均情境報酬": group["情境報酬"].dropna().mean() if group["情境報酬"].notna().any() else None,
+            "買進/正向評等數": int((group["建議分數"].fillna(0) > 0).sum()) if "建議分數" in group else 0,
+        })
+
+    return pd.DataFrame(rows).sort_values(["報告數", "平均潛在漲幅"], ascending=[False, False])
+
+
+def render_broker_report_analysis_app():
+    st.title("📈 券商研究報告分析工具")
+    st.caption("上傳券商 PDF 研究報告，自動擷取股票、券商、評等、目標價與報告日期，彙整成可比較的分析表。")
+
+    base_rows = st.session_state.get("auto_rows", [])
+    brokers = sorted({row.get("券商", "-") for row in base_rows + SAMPLE_ROWS if row.get("券商")})
+
+    with st.sidebar:
+        st.header("📁 上傳報告")
+        uploads = st.file_uploader(
+            "上傳券商研究報告 PDF",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="broker_report_uploads",
+        )
+        if st.button("處理上傳報告", key="broker_report_process", use_container_width=True):
+            if uploads:
+                st.session_state.auto_rows = []
+                st.session_state.auto_pending = []
+                st.session_state.auto_processed_files = set()
+                added, pending, skipped = process_tab_uploads(
+                    uploads,
+                    "auto_rows",
+                    "auto_pending",
+                    "auto_processed_files",
+                    parse_reports,
+                )
+                st.success(f"已加入 {added} 筆，待確認 {pending} 筆，重複略過 {skipped} 筆")
+            else:
+                st.warning("請先選擇 PDF")
+
+        if st.button("清除全部報告", key="broker_report_clear", use_container_width=True):
+            st.session_state.auto_rows = []
+            st.session_state.auto_pending = []
+            st.session_state.auto_processed_files = set()
+            st.rerun()
+
+        st.divider()
+        st.header("📊 分析設定")
+        scenario = st.selectbox("情境選擇", ["中性", "樂觀", "悲觀"], index=0, help="樂觀：目標價完全實現；中性：85%；悲觀：65%")
+        history_days = st.slider("歷史資料天數", min_value=20, max_value=1200, value=365, step=5)
+        recent_only = st.checkbox("只看近期報告", value=False)
+        recent_days = st.number_input("近期報告天數", min_value=1, max_value=365, value=90, step=5, disabled=not recent_only)
+        use_sample = st.checkbox("使用範例資料", value=not bool(base_rows))
+        stock_filter = st.text_input("篩選股票代碼", placeholder="例如 2308, 6805")
+        broker_filter = st.multiselect("篩選券商", brokers)
+
+    pending_rows = pending_report_rows()
+    all_report_universe = build_selection_universe(
+        base_rows + pending_rows,
+        use_sample,
+        False,
+        recent_days,
+        stock_filter,
+        broker_filter,
+        history_days,
+        scenario,
+    )
+    report_universe = build_selection_universe(
+        base_rows,
+        use_sample,
+        recent_only,
+        recent_days,
+        stock_filter,
+        broker_filter,
+        history_days,
+        scenario,
+    )
+
+    overview_tab, stock_tab, broker_tab, pending_tab = st.tabs(["📋 報告總覽", "📌 個股彙整", "🏦 券商觀點", "📝 待確認"])
+
+    with overview_tab:
+        overview = report_overview_df(all_report_universe)
+        if overview.empty:
+            st.info("尚無報告資料，請上傳 PDF 或勾選使用範例資料。")
+        else:
+            display = overview.copy()
+            display["目前股價"] = display["目前股價"].map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
+            display["目標股價"] = display["目標股價"].map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
+            display["潛在漲幅"] = display["潛在漲幅"].map(lambda value: "" if pd.isna(value) else f"{value:.1f}%")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("報告總數", len(display))
+            c2.metric("覆蓋股票數", display["股票代碼"].nunique())
+            c3.metric("券商數", display["券商"].nunique())
+            c4.metric("平均潛在漲幅", f"{overview['潛在漲幅'].dropna().mean():.1f}%" if overview["潛在漲幅"].notna().any() else "—")
+
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            chart = overview.dropna(subset=["潛在漲幅"]).set_index("股票代碼")["潛在漲幅"]
+            if not chart.empty:
+                st.subheader("各股潛在漲幅")
+                st.bar_chart(chart)
+
+    with stock_tab:
+        summary = report_stock_summary_df(report_universe)
+        if summary.empty:
+            st.info("尚無可彙整的個股資料。")
+        else:
+            display = summary.copy()
+            for column in ["目前價", "平均目標價", "最高目標價"]:
+                display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.2f}")
+            for column in ["平均潛在漲幅", "情境報酬"]:
+                display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.1f}%")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            upside = summary.dropna(subset=["平均潛在漲幅"]).set_index("股票")["平均潛在漲幅"]
+            if not upside.empty:
+                st.subheader("平均潛在漲幅排名")
+                st.bar_chart(upside.head(20))
+
+    with broker_tab:
+        broker_summary = broker_summary_df(report_universe)
+        if broker_summary.empty:
+            st.info("尚無券商觀點資料。")
+        else:
+            display = broker_summary.copy()
+            for column in ["平均潛在漲幅", "平均情境報酬"]:
+                display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.1f}%")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            broker_counts = broker_summary.set_index("券商")["報告數"]
+            st.subheader("券商報告數")
+            st.bar_chart(broker_counts)
+
+    with pending_tab:
+        if st.session_state.get("auto_pending"):
+            render_pending("auto_pending", "auto_rows", "broker")
+        else:
+            st.info("目前沒有待確認資料。")
+
+
 def display_percent_df(df, columns):
     result = df.copy()
     for column in columns:
@@ -2317,7 +2492,7 @@ def render_stock_picker_page():
             if institutional_csv:
                 imported_institutional = save_institutional_to_db(read_uploaded_csv(institutional_csv), source="csv")
             st.cache_data.clear()
-        st.success(f"已匯入月營收 {imported_revenue:,} 筆、法人買賣 {imported_institutional:,} 筆")
+            st.success(f"已匯入月營收 {imported_revenue:,} 筆、法人買賣 {imported_institutional:,} 筆")
 
         st.header("🔎 智慧選股")
         request_finmind_update = st.checkbox("缺資料時用 FinMind 更新資料庫", value=False)
@@ -2679,4 +2854,4 @@ if __name__ == "__main__":
     st.session_state.setdefault("auto_pending", [])
     st.session_state.setdefault("auto_processed_files", set())
 
-    render_stock_picker_page()
+    render_broker_report_analysis_app()
