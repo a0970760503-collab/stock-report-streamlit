@@ -2058,7 +2058,10 @@ def build_frontier_chart(frontier, current_stats):
                 opacity=0.72,
                 color=frontier["夏普比率"],
                 colorscale=[[0, "#ef4444"], [0.5, "#fff7a8"], [1, "#22c55e"]],
-                colorbar=dict(title="夏普比率", tickfont=dict(color="#e5eefb"), titlefont=dict(color="#ffffff")),
+                colorbar=dict(
+                    title=dict(text="夏普比率", font=dict(color="#ffffff")),
+                    tickfont=dict(color="#e5eefb"),
+                ),
                 line=dict(width=0),
             ),
             hovertemplate="年化波動 %{x:.1f}%<br>年化報酬 %{y:.1f}%<br>夏普比率 %{marker.color:.2f}<extra></extra>",
