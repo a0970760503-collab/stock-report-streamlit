@@ -6,11 +6,15 @@ import streamlit as st
 import streamlit_app as core
 
 
+SMART_PICKER_DB_IMPORT_PASSWORD = "330215dlEEVB"
+
+
 def init_smart_state():
     core.init_tab_state()
     st.session_state.setdefault("auto_rows", [])
     st.session_state.setdefault("auto_pending", [])
     st.session_state.setdefault("auto_processed_files", set())
+    st.session_state.setdefault("smart_picker_db_import_requested", False)
 
 
 def render_database_controls():
@@ -514,10 +518,19 @@ def render_smart_picker():
     st.title("智慧選股")
     st.caption("上傳券商報告建立股票池，再用低基期、三率三升、營收、法人、成交量與市值條件做交集篩選。")
 
-    base_rows = st.session_state.get("auto_rows", [])
-    brokers = sorted({row.get("券商", "-") for row in base_rows + core.SAMPLE_ROWS if row.get("券商")})
+    uploaded_rows = st.session_state.get("auto_rows", [])
+    database_rows = core.load_broker_database_rows()
+    brokers = sorted({row.get("券商", "-") for row in uploaded_rows + database_rows + core.SAMPLE_ROWS if row.get("券商")})
 
     with st.sidebar:
+        st.header("券商資料庫")
+        db_files, db_reports = core.broker_database_counts()
+        st.caption(f"檔案 {db_files:,} 個；報告 {db_reports:,} 筆")
+        use_broker_database = st.checkbox("載入券商資料庫", value=db_reports > 0, disabled=db_reports == 0)
+        st.caption("勾選後會把 broker_reports.db 內的券商報告加入智慧選股股票池。")
+        active_report_rows = (database_rows if use_broker_database else []) + uploaded_rows
+
+        st.divider()
         st.header("上傳報告")
         uploads = st.file_uploader(
             "上傳券商研究報告 PDF",
@@ -527,26 +540,32 @@ def render_smart_picker():
             help="請上傳券商或投顧發布的股票研究報告 PDF，內容需可擷取文字，系統會讀取股票代碼、券商、日期、評等與目標價。",
         )
         st.caption("可上傳單一個股或多檔個股的券商研究報告 PDF；掃描圖片式 PDF 可能無法正確解析。")
-        if st.button("處理上傳報告", key="smart_picker_process_uploads", use_container_width=True):
+        if st.button("匯入資料庫", key="smart_picker_request_db_import", use_container_width=True):
             if uploads:
-                st.session_state.auto_rows = []
-                st.session_state.auto_pending = []
-                st.session_state.auto_processed_files = set()
-                added, pending, skipped = core.process_tab_uploads(
-                    uploads,
-                    "auto_rows",
-                    "auto_pending",
-                    "auto_processed_files",
-                    core.parse_reports,
-                )
-                st.success(f"已加入 {added} 筆，待確認 {pending} 筆，重複略過 {skipped} 筆")
+                st.session_state.smart_picker_db_import_requested = True
             else:
                 st.warning("請先選擇檔案")
+
+        if st.session_state.get("smart_picker_db_import_requested"):
+            import_password = st.text_input("匯入資料庫密碼", type="password", key="smart_picker_db_import_password")
+            if st.button("確認匯入資料庫", key="smart_picker_confirm_db_import", use_container_width=True):
+                if not uploads:
+                    st.warning("請先選擇檔案")
+                elif import_password != SMART_PICKER_DB_IMPORT_PASSWORD:
+                    st.warning("匯入資料庫密碼不正確，檔案尚未入庫。")
+                else:
+                    st.session_state.auto_rows = []
+                    st.session_state.auto_pending = []
+                    st.session_state.auto_processed_files = set()
+                    imported, rows_added, pending, skipped = core.process_broker_uploads_to_database(uploads)
+                    st.session_state.smart_picker_db_import_requested = False
+                    st.success(f"已入庫 {imported} 個檔案，加入畫面 {rows_added} 筆，待確認 {pending} 筆，重複略過 {skipped} 個檔案")
 
         if st.button("清除上傳資料", key="smart_picker_clear_uploads", use_container_width=True):
             st.session_state.auto_rows = []
             st.session_state.auto_pending = []
             st.session_state.auto_processed_files = set()
+            st.session_state.smart_picker_db_import_requested = False
             st.rerun()
 
         st.divider()
@@ -558,7 +577,7 @@ def render_smart_picker():
         history_days = st.slider("歷史資料天數", min_value=20, max_value=1200, value=365, step=5)
         recent_only = st.checkbox("只看近期報告", value=False)
         recent_days = st.number_input("近期報告天數", min_value=1, max_value=365, value=90, step=5, disabled=not recent_only)
-        use_sample = st.checkbox("使用範例資料", value=not bool(base_rows))
+        use_sample = st.checkbox("使用範例資料", value=not bool(active_report_rows))
 
         st.header("策略條件")
         finmind_token, allow_finmind_update = finmind_update_controls()
@@ -573,6 +592,8 @@ def render_smart_picker():
         weight_mode = st.selectbox("權重模式", ["等權重", "依智慧分數", "依情境報酬"])
         stock_filter = st.text_input("篩選股票代碼", placeholder="例如 2308, 6805")
         broker_filter = st.multiselect("篩選券商", brokers)
+
+    base_rows = (core.load_broker_database_rows() if use_broker_database else []) + st.session_state.get("auto_rows", [])
 
     if st.session_state.get("auto_pending"):
         with st.expander("待確認資料", expanded=False):
@@ -612,7 +633,7 @@ def render_smart_picker():
     selected = core.add_weights(selected_raw, weight_mode)
 
     if stock_universe.empty:
-        st.info("尚無候選股票。請先上傳報告，或勾選使用範例資料。")
+        st.info("尚無候選股票。請先載入券商資料庫、上傳報告，或勾選使用範例資料。")
         return
 
     render_smart_dashboard(stock_universe, selected, max_stocks)
