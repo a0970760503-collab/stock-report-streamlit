@@ -7,6 +7,7 @@ import streamlit_app as core
 
 
 SMART_PICKER_DB_IMPORT_PASSWORD = "330215dlEEVB"
+SMART_PICKER_FINMIND_PASSWORD = "FEXOOML-62150"
 
 
 def init_smart_state():
@@ -41,16 +42,13 @@ def finmind_update_controls():
     if not request_update:
         return "", False
 
-    configured_password = core.configured_finmind_password()
+    configured_password = core.configured_finmind_password() or SMART_PICKER_FINMIND_PASSWORD
     password = st.text_input(
         "FinMind 使用密碼",
         type="password",
         help="輸入正確使用密碼後，才會允許用 FinMind 補齊缺漏資料。",
     )
 
-    if not configured_password:
-        st.warning("尚未設定 FINMIND_UPDATE_PASSWORD，FinMind 更新功能已停用。")
-        return "", False
     if not password:
         st.info("請先輸入 FinMind 使用密碼，才會啟用更新。")
         return "", False
