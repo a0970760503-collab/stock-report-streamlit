@@ -443,7 +443,7 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
     default_display = min(display_cap, max(10, int(max_stocks)))
     c1, c2, c3 = st.columns([1, 1.25, 1.25])
     with c1:
-        if display_cap >= min_display:
+        if display_cap > min_display:
             default_display = max(min_display, min(default_display, display_cap))
             show_count = st.slider(
                 "顯示前",
