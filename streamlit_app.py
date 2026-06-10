@@ -26,6 +26,28 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "stock_data.db"
 BROKER_DB_PATH = BASE_DIR / "broker_reports.db"
 
+STOCK_NAME_OVERRIDES = {
+    "2454": "聯發科",
+}
+
+TW_STOCK_MASTER_SOURCES = [
+    {
+        "market": "上市",
+        "source": "TWSE",
+        "url": "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+    },
+    {
+        "market": "上櫃",
+        "source": "TPEx",
+        "url": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+    },
+]
+
+COMPANY_NAME_NOISE_PATTERN = re.compile(
+    r"(?:\bTP\b|目標價|目標|上調|下調|調升|調降|維持|買進|持有|賣出|觀察|中立|凱基|華南|富邦|群益|國泰|元大|統一|中信|宏遠|GS|MS|CLSA)",
+    re.IGNORECASE,
+)
+
 
 def apply_app_style():
     st.markdown(
@@ -285,13 +307,29 @@ def extract_pdf_text(uploaded_file):
     return "\n".join(parts)[:12000]
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_pdf_text_from_path(file_path, modified_at=None):
+    try:
+        path = Path(str(file_path or ""))
+        if not path.exists() or path.suffix.lower() != ".pdf":
+            return ""
+        doc = fitz.open(path)
+        parts = []
+        for page_index in range(min(len(doc), 5)):
+            parts.append(doc[page_index].get_text())
+        return "\n".join(parts)[:12000]
+    except Exception:
+        return ""
+
+
 def normalize_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
 def number(value):
     try:
-        return float(str(value).replace(",", "").strip())
+        parsed = float(str(value).replace(",", "").strip())
+        return None if math.isnan(parsed) else parsed
     except Exception:
         return None
 
@@ -302,6 +340,42 @@ def format_num(value):
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def clean_company_name(stock_code, company):
+    code = str(stock_code or "").strip()
+    master_name = stock_master_name(code)
+    if master_name:
+        return master_name
+
+    text = str(company or "").strip()
+    if code in STOCK_NAME_OVERRIDES and (
+        not text
+        or text == "-"
+        or COMPANY_NAME_NOISE_PATTERN.search(text)
+        or re.search(r"\d", text)
+    ):
+        return STOCK_NAME_OVERRIDES[code]
+    return text or "-"
+
+
+def normalize_api_text(value):
+    return str(value or "").replace("\u3000", " ").strip()
+
+
+def row_first(row, *keys):
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return normalize_api_text(value)
+    return ""
+
+
+def stock_master_name(stock_code):
+    code = str(stock_code or "").split(".")[0].strip()
+    if not code:
+        return ""
+    return load_stock_master_name_map().get(code) or STOCK_NAME_OVERRIDES.get(code, "")
 
 
 def extract_stock_code(text):
@@ -1069,8 +1143,49 @@ def row_with_gain(row):
     target = number(item.get("目標價"))
     item["目前價"] = current
     item["目標價"] = target
-    item["漲幅"] = None if current is None or target is None or current == 0 else ((target - current) / current) * 100
+    item["漲幅"] = calculate_upside(current, target)
     return item
+
+
+def calculate_upside(current, target):
+    current_value = number(current)
+    target_value = number(target)
+    if current_value is None or target_value is None or current_value == 0:
+        return None
+    return ((target_value - current_value) / current_value) * 100
+
+
+def fill_missing_current_prices(df):
+    if df.empty or "股票" not in df or "目前價" not in df:
+        return df
+
+    result = df.copy()
+    target_series = result["目標價"].map(number) if "目標價" in result else pd.Series([None] * len(result), index=result.index)
+    stocks_with_target = {
+        str(stock).strip()
+        for stock in result.loc[target_series.notna(), "股票"]
+        if re.fullmatch(r"\d{4}", str(stock).strip())
+    }
+    needs_price = result["目前價"].map(number).isna() & result["股票"].map(lambda stock: str(stock).strip() in stocks_with_target)
+    missing_stocks = sorted({
+        str(stock).strip()
+        for stock in result.loc[needs_price, "股票"]
+        if re.fullmatch(r"\d{4}", str(stock).strip())
+    })
+    price_map = {}
+    for stock in missing_stocks:
+        quote = fetch_quote(stock)
+        price = number(quote.get("price"))
+        if price is None:
+            hist = fetch_history(stock, 20)
+            if not hist.empty and "收盤價" in hist:
+                price = number(hist["收盤價"].iloc[-1])
+        if price is not None:
+            price_map[stock] = price
+
+    if price_map:
+        result.loc[needs_price, "目前價"] = result.loc[needs_price, "股票"].map(lambda stock: price_map.get(str(stock).strip()))
+    return result
 
 
 def stock_filter_codes(stock_filter):
@@ -1098,6 +1213,11 @@ def yfinance_rating_label(value):
         "sell": "賣出",
     }
     return labels.get(key, str(value or "").strip())
+
+
+def normalize_rating_display(value):
+    rating = str(value or "").strip()
+    return "" if rating in {"有建議/推薦"} else rating
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1343,6 +1463,21 @@ def init_stock_database():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS tw_stock_master (
+                stock_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                full_name TEXT,
+                market TEXT NOT NULL,
+                industry_code TEXT,
+                listed_date TEXT,
+                source TEXT,
+                source_date TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS monthly_revenue (
                 stock_id TEXT NOT NULL,
                 date TEXT,
@@ -1369,6 +1504,85 @@ def init_stock_database():
             )
             """
         )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_stock_master_name_map():
+    init_stock_database()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT stock_id, name FROM tw_stock_master WHERE stock_id GLOB '[0-9][0-9][0-9][0-9]'"
+            ).fetchall()
+    except Exception:
+        rows = []
+    result = {str(stock_id): str(name) for stock_id, name in rows if stock_id and name}
+    result.update({code: name for code, name in STOCK_NAME_OVERRIDES.items() if code not in result})
+    return result
+
+
+def stock_master_counts():
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM tw_stock_master").fetchone()[0]
+        updated_at = conn.execute("SELECT MAX(updated_at) FROM tw_stock_master").fetchone()[0]
+        by_market = dict(conn.execute("SELECT market, COUNT(*) FROM tw_stock_master GROUP BY market").fetchall())
+    return total, updated_at, by_market
+
+
+def parse_stock_master_payload(payload, market, source):
+    rows = []
+    for item in payload or []:
+        stock = row_first(item, "公司代號", "SecuritiesCompanyCode")
+        name = row_first(item, "公司簡稱", "CompanyAbbreviation")
+        full_name = row_first(item, "公司名稱", "CompanyName")
+        if not re.fullmatch(r"\d{4}", stock or "") or not name:
+            continue
+        rows.append({
+            "stock_id": stock,
+            "name": name,
+            "full_name": full_name or name,
+            "market": market,
+            "industry_code": row_first(item, "產業別", "SecuritiesIndustryCode"),
+            "listed_date": row_first(item, "上市日期", "上櫃日期", "DateOfListing"),
+            "source": source,
+            "source_date": row_first(item, "出表日期", "Date"),
+        })
+    return rows
+
+
+def fetch_stock_master_rows():
+    rows = []
+    headers = yahoo_headers()
+    for config in TW_STOCK_MASTER_SOURCES:
+        response = requests.get(config["url"], headers=headers, timeout=30)
+        response.raise_for_status()
+        response.encoding = "utf-8-sig"
+        rows.extend(parse_stock_master_payload(response.json(), config["market"], config["source"]))
+    return rows
+
+
+def refresh_tw_stock_master():
+    rows = fetch_stock_master_rows()
+    if len(rows) < 1000:
+        raise ValueError(f"股票主檔筆數異常：只取得 {len(rows)} 筆")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM tw_stock_master")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO tw_stock_master
+                (stock_id, name, full_name, market, industry_code, listed_date, source, source_date, updated_at)
+            VALUES
+                (:stock_id, :name, :full_name, :market, :industry_code, :listed_date, :source, :source_date, :updated_at)
+            """,
+            [{**row, "updated_at": now} for row in rows],
+        )
+
+    load_stock_master_name_map.clear()
+    return stock_master_counts()
 
 
 def database_counts():
@@ -1600,20 +1814,23 @@ def load_broker_database_rows():
 
     rows = []
     for _, item in df.iterrows():
+        stock = str(item.get("stock") or "")
+        raw_text = item.get("raw_text") or ""
+        rating = normalize_rating_display(item.get("rating")) or normalize_rating_display(extract_rating_near_stock(raw_text, stock)) or normalize_rating_display(extract_rating(raw_text))
         rows.append({
             "檔名": item.get("file_name") or "",
             "檔案路徑": item.get("file_path") or "",
-            "股票": str(item.get("stock") or ""),
-            "公司": item.get("company") or "-",
+            "股票": stock,
+            "公司": clean_company_name(stock, item.get("company")),
             "券商": item.get("broker") or "-",
             "資料日期": item.get("report_date") or "-",
-            "建議/推薦": item.get("rating") or "",
+            "建議/推薦": rating,
             "目前價": None,
             "目標價": item.get("target_price"),
             "漲幅": None,
             "狀態": "資料庫",
             "備註": item.get("parse_status") or "",
-            "原文": item.get("raw_text") or "",
+            "原文": raw_text,
             "評價原因": item.get("reason") or "",
         })
     return rows
@@ -2063,6 +2280,7 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
 
     df["券商"] = df["券商"].fillna("-").replace("", "-")
     df["公司"] = df["公司"].fillna("-").replace("", "-")
+    df["公司"] = df.apply(lambda row: clean_company_name(row.get("股票"), row.get("公司")), axis=1)
     df["建議/推薦"] = df["建議/推薦"].fillna("")
     df["狀態"] = df["狀態"].fillna("已入表")
     df["備註"] = df["備註"].fillna("")
@@ -2081,6 +2299,9 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
 
     if df.empty:
         return df.reset_index(drop=True)
+
+    df = fill_missing_current_prices(df)
+    df["漲幅"] = df.apply(lambda row: calculate_upside(row.get("目前價"), row.get("目標價")), axis=1)
 
     metrics = []
     rate = scenario_rate(scenario)
@@ -2326,15 +2547,28 @@ def format_analysis_df(df):
 
 
 def report_detail_display_df(related_reports):
-    columns = ["目前價", "目標價", "漲幅"]
+    columns = ["資料日期", "券商", "目前價", "目標價", "漲幅"]
     available = [column for column in columns if column in related_reports.columns]
     display = related_reports[available].copy() if available else pd.DataFrame()
-    if "建議/推薦" in related_reports.columns:
-        display["推薦/建議"] = related_reports["建議/推薦"]
-    elif "評等" in related_reports.columns:
-        display["推薦/建議"] = related_reports["評等"]
+    if related_reports.empty:
+        display["推薦/建議"] = ""
+    else:
+        def report_rating(item):
+            rating = normalize_rating_display(item.get("建議/推薦") or item.get("評等"))
+            if rating:
+                return rating
+            raw_text = item.get("原文") or ""
+            if not raw_text and item.get("檔案路徑"):
+                path = Path(str(item.get("檔案路徑")))
+                modified_at = path.stat().st_mtime if path.exists() else None
+                raw_text = extract_pdf_text_from_path(str(path), modified_at)
+            return normalize_rating_display(extract_rating_near_stock(raw_text, item.get("股票", ""))) or normalize_rating_display(extract_rating(raw_text))
 
-    for column in ["推薦/建議", "目前價", "目標價", "漲幅"]:
+        display["推薦/建議"] = related_reports.apply(report_rating, axis=1)
+
+    display = display.rename(columns={"資料日期": "報告發行日"})
+
+    for column in ["報告發行日", "券商", "推薦/建議", "目前價", "目標價", "漲幅"]:
         if column not in display:
             display[column] = ""
 
@@ -2350,7 +2584,7 @@ def report_detail_display_df(related_reports):
         return f"{upside:.1f}%"
 
     display["漲幅"] = display["漲幅"].map(format_upside)
-    return display[["推薦/建議", "目前價", "目標價", "漲幅"]]
+    return display[["報告發行日", "券商", "推薦/建議", "目前價", "目標價", "漲幅"]]
 
 
 def broker_reason_display_df(related_reports):
@@ -2839,6 +3073,19 @@ def render_broker_report_analysis_app():
         st.header("🗄️ 券商資料庫")
         db_files, db_reports = broker_database_counts()
         st.caption(f"檔案 {db_files:,} 個；報告 {db_reports:,} 筆")
+        master_total, master_updated, master_by_market = stock_master_counts()
+        market_text = " / ".join(f"{market} {count:,}" for market, count in sorted(master_by_market.items())) or "尚未建立"
+        st.caption(f"股票對照 {master_total:,} 檔（{market_text}）")
+        if master_updated:
+            st.caption(f"對照表更新：{master_updated}")
+        if st.button("更新上市上櫃代碼表", key="refresh_tw_stock_master", use_container_width=True):
+            try:
+                with st.spinner("正在下載 TWSE / TPEx 官方股票主檔..."):
+                    total, updated_at, by_market = refresh_tw_stock_master()
+                st.success(f"已更新 {total:,} 檔股票：上市 {by_market.get('上市', 0):,}，上櫃 {by_market.get('上櫃', 0):,}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"股票對照表更新失敗：{exc}")
         use_broker_database = st.checkbox("載入券商資料庫", value=True, disabled=db_reports == 0)
         st.divider()
 
