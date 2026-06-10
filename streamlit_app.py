@@ -2325,6 +2325,42 @@ def format_analysis_df(df):
     return display
 
 
+def report_detail_display_df(related_reports):
+    columns = ["目前價", "目標價", "漲幅"]
+    available = [column for column in columns if column in related_reports.columns]
+    display = related_reports[available].copy() if available else pd.DataFrame()
+    if "建議/推薦" in related_reports.columns:
+        display["推薦/建議"] = related_reports["建議/推薦"]
+    elif "評等" in related_reports.columns:
+        display["推薦/建議"] = related_reports["評等"]
+
+    for column in ["推薦/建議", "目前價", "目標價", "漲幅"]:
+        if column not in display:
+            display[column] = ""
+
+    for column in ["目前價", "目標價"]:
+        display[column] = display[column].map(lambda value: format_num(number(value)) if number(value) is not None else "")
+
+    def format_upside(value):
+        upside = number(value)
+        if upside is None:
+            return ""
+        if upside < 0:
+            return "備註：目標價低於目前價，暗示下行風險"
+        return f"{upside:.1f}%"
+
+    display["漲幅"] = display["漲幅"].map(format_upside)
+    return display[["推薦/建議", "目前價", "目標價", "漲幅"]]
+
+
+def broker_reason_display_df(related_reports):
+    reasons = broker_reason_df(related_reports)
+    if reasons.empty or "評價原因" not in reasons:
+        return pd.DataFrame()
+    display = reasons[["評價原因"]].copy()
+    return display.rename(columns={"評價原因": "推薦/建議原因"})
+
+
 def tw_symbol(stock_code):
     code = str(stock_code or "").strip()
     return code if "." in code else f"{code}.TW"
@@ -2682,24 +2718,6 @@ def report_stock_summary_df(report_df):
     return pd.DataFrame(rows).sort_values(["平均潛在漲幅", "報告數"], ascending=[False, False])
 
 
-def broker_summary_df(report_df):
-    if report_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for broker, group in report_df.groupby("券商", sort=True):
-        rows.append({
-            "券商": broker or "-",
-            "報告數": len(group),
-            "覆蓋股票數": group["股票"].nunique(),
-            "平均潛在漲幅": group["漲幅"].dropna().mean() if group["漲幅"].notna().any() else None,
-            "平均情境報酬": group["情境報酬"].dropna().mean() if group["情境報酬"].notna().any() else None,
-            "買進/正向評等數": int((group["建議分數"].fillna(0) > 0).sum()) if "建議分數" in group else 0,
-        })
-
-    return pd.DataFrame(rows).sort_values(["報告數", "平均潛在漲幅"], ascending=[False, False])
-
-
 def split_reason_sentences(text):
     clean = normalize_text(text)
     if not clean:
@@ -2883,12 +2901,11 @@ def render_broker_report_analysis_app():
 
     portfolio_universe = broker_portfolio_universe(report_universe, history_days)
 
-    overview_tab, stock_tab, detail_tab, portfolio_tab, broker_tab, pending_tab = st.tabs([
+    overview_tab, stock_tab, detail_tab, portfolio_tab, pending_tab = st.tabs([
         "📋 報告總覽",
         "📌 個股彙整",
         "🔍 個股分析",
         "📦 投資組合",
-        "🏦 券商觀點",
         "📝 待確認",
     ])
 
@@ -2950,15 +2967,13 @@ def render_broker_report_analysis_app():
             left, right = st.columns([1.1, 1.6])
             with left:
                 st.subheader("報告明細")
-                detail_cols = ["資料日期", "券商", "建議/推薦", "目前價", "目標價", "漲幅", "情境報酬"]
-                detail_cols = [col for col in detail_cols if col in related_reports.columns]
-                st.dataframe(format_analysis_df(related_reports[detail_cols]), use_container_width=True, hide_index=True)
+                st.dataframe(report_detail_display_df(related_reports), use_container_width=True, hide_index=True)
                 st.subheader("券商評價原因")
-                reasons = broker_reason_df(related_reports)
+                reasons = broker_reason_display_df(related_reports)
                 if reasons.empty:
                     st.info("沒有可擷取的評價原因。")
                 else:
-                    st.dataframe(format_analysis_df(reasons), use_container_width=True, hide_index=True)
+                    st.dataframe(reasons, use_container_width=True, hide_index=True)
             with right:
                 hist = analysis_history(row, history_days)
                 forecast = forecast_history(row, hist, forecast_days, scenario)
@@ -3049,19 +3064,6 @@ def render_broker_report_analysis_app():
                     st.info("沒有累積報酬資料。")
                 else:
                     st.line_chart(cumulative)
-
-    with broker_tab:
-        broker_summary = broker_summary_df(report_universe)
-        if broker_summary.empty:
-            st.info("尚無券商觀點資料。")
-        else:
-            display = broker_summary.copy()
-            for column in ["平均潛在漲幅", "平均情境報酬"]:
-                display[column] = display[column].map(lambda value: "" if pd.isna(value) else f"{value:.1f}%")
-            st.dataframe(display, use_container_width=True, hide_index=True)
-            broker_counts = broker_summary.set_index("券商")["報告數"]
-            st.subheader("券商報告數")
-            st.bar_chart(broker_counts)
 
     with pending_tab:
         if st.session_state.get("auto_pending"):
