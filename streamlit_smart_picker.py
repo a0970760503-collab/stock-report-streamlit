@@ -34,27 +34,33 @@ def render_database_controls():
 
 def finmind_update_controls():
     request_update = st.checkbox("缺資料時用 FinMind 更新資料庫", value=False)
-    password_ok = False
+    if not request_update:
+        return "", False
+
     configured_password = core.configured_finmind_password()
-
-    if request_update:
-        password = st.text_input("FinMind 使用密碼", type="password")
-        if not configured_password:
-            st.warning("尚未設定 FINMIND_UPDATE_PASSWORD，FinMind 更新功能已停用。")
-        elif password == configured_password:
-            password_ok = True
-            st.success("FinMind 更新已解鎖。")
-        elif password:
-            st.warning("FinMind 使用密碼不正確，將只讀本機資料庫。")
-
-    allow_update = request_update and password_ok
-    token = st.text_input(
-        "FinMind Token（可留空）",
+    password = st.text_input(
+        "FinMind 使用密碼",
         type="password",
-        disabled=not allow_update,
-        help="只有勾選並輸入正確使用密碼後才會使用 FinMind；留空會嘗試公開額度。",
+        help="輸入正確使用密碼後，才會允許用 FinMind 補齊缺漏資料。",
     )
-    return token, allow_update
+
+    if not configured_password:
+        st.warning("尚未設定 FINMIND_UPDATE_PASSWORD，FinMind 更新功能已停用。")
+        return "", False
+    if not password:
+        st.info("請先輸入 FinMind 使用密碼，才會啟用更新。")
+        return "", False
+    if password != configured_password:
+        st.warning("FinMind 使用密碼不正確，將只讀本機資料庫。")
+        return "", False
+
+    st.success("FinMind 更新已解鎖。")
+    token = st.text_input(
+        "FinMind API Token（可留空）",
+        type="password",
+        help="可填 FinMind API token；留空會嘗試使用公開額度。",
+    )
+    return token, True
 
 
 def render_strategy_explanation():
@@ -432,11 +438,23 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
 
     st.write("")
     pool = st.radio("股票池", ["精選池", "全市場", "預警池"], horizontal=True, label_visibility="collapsed")
-    max_display = max(5, min(50, len(universe)))
-    default_display = min(max_display, max(10, int(max_stocks)))
+    display_cap = min(50, len(universe))
+    min_display = 5
+    default_display = min(display_cap, max(10, int(max_stocks)))
     c1, c2, c3 = st.columns([1, 1.25, 1.25])
     with c1:
-        show_count = st.slider("顯示前", min_value=5, max_value=max_display, value=default_display, step=1)
+        if display_cap >= min_display:
+            default_display = max(min_display, min(default_display, display_cap))
+            show_count = st.slider(
+                "顯示前",
+                min_value=min_display,
+                max_value=display_cap,
+                value=default_display,
+                step=1,
+            )
+        else:
+            show_count = display_cap
+            st.metric("顯示前", f"{show_count} 檔")
     with c2:
         stage_filter = st.selectbox("篩選", ["全部階段"] + sorted(universe["_stage"].dropna().unique().tolist()))
     with c3:
@@ -502,11 +520,13 @@ def render_smart_picker():
     with st.sidebar:
         st.header("上傳報告")
         uploads = st.file_uploader(
-            "上傳 PDF",
+            "上傳券商研究報告 PDF",
             type=["pdf"],
             accept_multiple_files=True,
             key="smart_picker_uploads",
+            help="請上傳券商或投顧發布的股票研究報告 PDF，內容需可擷取文字，系統會讀取股票代碼、券商、日期、評等與目標價。",
         )
+        st.caption("可上傳單一個股或多檔個股的券商研究報告 PDF；掃描圖片式 PDF 可能無法正確解析。")
         if st.button("處理上傳報告", key="smart_picker_process_uploads", use_container_width=True):
             if uploads:
                 st.session_state.auto_rows = []
