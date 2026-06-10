@@ -72,7 +72,7 @@ def finmind_update_controls():
 def render_strategy_explanation():
     st.markdown(
         """
-        **策略邏輯：** 先以上傳報告形成股票池；三率用 yfinance 季財報，月營收與外資+投信買超優先讀 SQLite 本機資料庫，成交量與市值用 yfinance，最後取策略條件交集。
+        **策略邏輯：** 以本機月營收資料庫建立全台股股票池；券商報告與 YF 目標價作為評價補強，三率用 yfinance 季財報，月營收與外資+投信買超優先讀 SQLite 本機資料庫，成交量與市值用 yfinance，最後取策略條件交集。
         """
     )
     with st.expander("策略條件怎麼判斷？", expanded=True):
@@ -107,21 +107,6 @@ def smart_pct_text(value, digits=1):
     if parsed is None or pd.isna(parsed):
         return "-"
     return f"{parsed:.{digits}f}%"
-
-
-def smart_stage(row):
-    score = smart_num(row.get("智慧分數"))
-    strategy_pass = bool(row.get("策略通過"))
-    low_base = bool(row.get("低基期"))
-    revenue = bool(row.get("營收條件"))
-    institutional = bool(row.get("法人買入"))
-    if strategy_pass or (score >= 90 and revenue and institutional):
-        return "Stage 2 — 主升段", "stage-hot"
-    if score >= 60 or low_base:
-        return "Stage 1 — 潛伏段", "stage-base"
-    if smart_num(row.get("情境報酬")) < 0 or score < 20:
-        return "Watch — 風險觀察", "stage-risk"
-    return "Stage 0 — 觀察池", "stage-watch"
 
 
 def smart_badge(text, kind="neutral"):
@@ -159,7 +144,6 @@ def smart_table_html(df):
     max_score = max(100.0, float(df["智慧分數"].fillna(0).max()) if "智慧分數" in df else 100.0)
     rows = []
     for rank, (_, row) in enumerate(df.iterrows(), start=1):
-        stage_label, stage_class = smart_stage(row)
         score = smart_num(row.get("智慧分數"))
         score_width = max(4, min(100, score / max_score * 100))
         code = html.escape(smart_text(row.get("股票")))
@@ -174,56 +158,22 @@ def smart_table_html(df):
         volume = smart_num(row.get("平均成交張數"), None)
         volume_text = "-" if volume is None else f"{volume:,.0f}"
         rows.append(
-            f"""
-            <tr>
-                <td class="rank">{rank}</td>
-                <td>
-                    <div class="stock-code">{code}</div>
-                    <div class="stock-name">{company}</div>
-                </td>
-                <td class="price">{price_text}</td>
-                <td><span class="stage-pill {stage_class}">{html.escape(stage_label)}</span></td>
-                <td class="signals">{smart_signal_badges(row)}</td>
-                <td>
-                    <div class="score-wrap">
-                        <strong>{score:.0f}</strong>
-                        <span>{score_delta}</span>
-                    </div>
-                    <div class="score-bar"><i style="width:{score_width:.0f}%"></i></div>
-                </td>
-                <td>
-                    <div class="stars">{smart_rating_stars(row)}</div>
-                    <div class="rating-text">{html.escape(smart_text(row.get("建議/推薦"), "未評"))}</div>
-                </td>
-                <td>{target_text}</td>
-                <td>{low_base}</td>
-                <td>{volume_text}</td>
-                <td class="broker">{broker}</td>
-            </tr>
-            """
+            f'<tr><td class="rank">{rank}</td>'
+            f'<td><div class="stock-code">{code}</div><div class="stock-name">{company}</div></td>'
+            f'<td class="price">{price_text}</td>'
+            f'<td class="signals">{smart_signal_badges(row)}</td>'
+            f'<td><div class="score-wrap"><strong>{score:.0f}</strong><span>{score_delta}</span></div>'
+            f'<div class="score-bar"><i style="width:{score_width:.0f}%"></i></div></td>'
+            f'<td><div class="stars">{smart_rating_stars(row)}</div>'
+            f'<div class="rating-text">{html.escape(smart_text(row.get("建議/推薦"), "未評"))}</div></td>'
+            f'<td>{target_text}</td><td>{low_base}</td><td>{volume_text}</td><td class="broker">{broker}</td></tr>'
         )
-    return f"""
-    <div class="smart-table-shell">
-        <table class="smart-table">
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>股票</th>
-                    <th>現價</th>
-                    <th>Weinstein 階段</th>
-                    <th>觸發訊號</th>
-                    <th>評分</th>
-                    <th>評級</th>
-                    <th>目標價</th>
-                    <th>低基期</th>
-                    <th>量能</th>
-                    <th>券商</th>
-                </tr>
-            </thead>
-            <tbody>{''.join(rows)}</tbody>
-        </table>
-    </div>
-    """
+    return (
+        '<div class="smart-table-shell"><table class="smart-table"><thead><tr>'
+        '<th>#</th><th>股票</th><th>現價</th><th>觸發訊號</th><th>評分</th>'
+        '<th>評級</th><th>目標價</th><th>低基期</th><th>量能</th><th>券商</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+    )
 
 
 def render_smart_dashboard(stock_universe, selected, max_stocks):
@@ -335,7 +285,7 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
             color: #dff8ff;
             font-weight: 800;
         }
-        .stage-pill, .smart-badge {
+        .smart-badge {
             display: inline-flex;
             align-items: center;
             min-height: 24px;
@@ -346,22 +296,22 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
             font-size: .78rem;
             white-space: nowrap;
         }
-        .stage-hot, .gold {
+        .gold {
             color: #ffd84a;
             border: 1px solid rgba(255, 216, 74, .58);
             background: rgba(255, 216, 74, .12);
         }
-        .stage-base, .green {
+        .green {
             color: #16ffc4;
             border: 1px solid rgba(22, 255, 196, .34);
             background: rgba(22, 255, 196, .10);
         }
-        .stage-watch, .blue, .cyan {
+        .blue, .cyan {
             color: #7bdcff;
             border: 1px solid rgba(123, 220, 255, .30);
             background: rgba(0, 145, 255, .12);
         }
-        .stage-risk, .red {
+        .red {
             color: #ff6b8a;
             border: 1px solid rgba(255, 107, 138, .32);
             background: rgba(255, 107, 138, .12);
@@ -416,10 +366,9 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
     )
 
     universe = stock_universe.copy()
-    universe["_stage"] = universe.apply(lambda row: smart_stage(row)[0], axis=1)
     universe["_score"] = universe["智慧分數"].fillna(0) if "智慧分數" in universe else 0
-    stage2_count = int((universe["_stage"] == "Stage 2 — 主升段").sum())
     strategy_count = int(universe["策略通過"].fillna(False).sum()) if "策略通過" in universe else 0
+    covered_count = int((universe["報告筆數"].fillna(0) > 0).sum()) if "報告筆數" in universe else 0
     highest_score = smart_num(universe["智慧分數"].max()) if "智慧分數" in universe else 0
     avg_return = universe["情境報酬"].dropna().mean() if "情境報酬" in universe else None
     avg_return_text = "-" if avg_return is None or pd.isna(avg_return) else f"{avg_return:.1f}%"
@@ -428,14 +377,14 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
         f"""
         <div class="smart-lab">
             <div class="smart-lab-top">
-                <div><span class="market-dot"></span>智慧選股作戰台&nbsp;&nbsp; <strong>Stage 2 — 主升段</strong>&nbsp;&nbsp; 報告池 {len(universe):,} | 平均情境報酬 {avg_return_text}</div>
+                <div><span class="market-dot"></span>智慧選股作戰台&nbsp;&nbsp; <strong>全台股池</strong>&nbsp;&nbsp; 股票池 {len(universe):,} | 平均情境報酬 {avg_return_text}</div>
                 <div class="market-note">策略交集越完整，訊號可信度越高</div>
             </div>
             <div class="smart-stat-grid">
                 <div class="smart-stat"><strong>{len(universe):,}</strong><span>股票池</span></div>
                 <div class="smart-stat"><strong>{strategy_count:,}</strong><span>策略通過</span></div>
                 <div class="smart-stat"><strong>{highest_score:.0f}</strong><span>最高評分</span></div>
-                <div class="smart-stat"><strong>{stage2_count:,}</strong><span>Stage 2 主升段</span></div>
+                <div class="smart-stat"><strong>{covered_count:,}</strong><span>券商報告覆蓋</span></div>
             </div>
         </div>
         """,
@@ -450,7 +399,7 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
         display_cap = min(50, len(universe))
     min_display = 5
     default_display = min(display_cap, int(max_stocks) if pool == "精選池" else max(10, int(max_stocks)))
-    c1, c2, c3 = st.columns([1, 1.25, 1.25])
+    c1, c2 = st.columns([1, 1.25])
     with c1:
         if display_cap > min_display:
             default_display = max(min_display, min(default_display, display_cap))
@@ -465,8 +414,6 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
             show_count = display_cap
             st.metric("顯示前", f"{show_count} 檔")
     with c2:
-        stage_filter = st.selectbox("篩選", ["全部階段"] + sorted(universe["_stage"].dropna().unique().tolist()))
-    with c3:
         sort_mode = st.selectbox("排序", ["依評分排序", "依情境報酬排序", "依低基期排序", "依報告數排序"])
 
     if pool == "精選池":
@@ -476,11 +423,6 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
         frame = universe[(~strategy_mask) | (universe["_score"] < 40)].copy()
     else:
         frame = universe.copy()
-
-    if not frame.empty:
-        frame["_stage"] = frame.apply(lambda row: smart_stage(row)[0], axis=1)
-        if stage_filter != "全部階段":
-            frame = frame[frame["_stage"] == stage_filter]
 
     sort_columns = {
         "依評分排序": ("智慧分數", False),
@@ -523,11 +465,12 @@ def render_smart_picker():
     init_smart_state()
 
     st.title("智慧選股")
-    st.caption("上傳券商報告建立股票池，再用低基期、三率三升、營收、法人、成交量與市值條件做交集篩選。")
+    st.caption("以全台股為股票池，搭配券商報告、YF 行情、低基期、三率三升、營收、法人、成交量與市值條件做交集篩選。")
 
     uploaded_rows = [row for row in st.session_state.get("auto_rows", []) if is_tw_stock_row(row)]
     database_rows_all = core.load_broker_database_rows()
     database_rows = [row for row in database_rows_all if is_tw_stock_row(row)]
+    taiwan_stock_rows = core.load_taiwan_stock_rows()
     brokers = sorted({row.get("券商", "-") for row in uploaded_rows + database_rows + core.SAMPLE_ROWS if row.get("券商")})
 
     with st.sidebar:
@@ -535,9 +478,10 @@ def render_smart_picker():
         db_files, db_reports = core.broker_database_counts()
         st.caption(f"檔案 {db_files:,} 個；報告 {db_reports:,} 筆")
         st.caption(f"台股可用報告 {len(database_rows):,} 筆；空白、產業報告與美股已排除")
+        st.caption(f"全台股股票池 {len(taiwan_stock_rows):,} 檔")
         use_broker_database = st.checkbox("載入券商資料庫", value=bool(database_rows), disabled=not bool(database_rows))
         st.caption("勾選後會把 broker_reports.db 內的券商報告加入智慧選股股票池。")
-        active_report_rows = (database_rows if use_broker_database else []) + uploaded_rows
+        active_report_rows = taiwan_stock_rows + (database_rows if use_broker_database else []) + uploaded_rows
 
         st.divider()
         st.header("上傳報告")
@@ -606,9 +550,10 @@ def render_smart_picker():
         )
         broker_filter = st.multiselect("篩選券商", brokers)
 
+    latest_taiwan_stock_rows = core.load_taiwan_stock_rows()
     latest_database_rows = [row for row in core.load_broker_database_rows() if is_tw_stock_row(row)] if use_broker_database else []
     latest_uploaded_rows = [row for row in st.session_state.get("auto_rows", []) if is_tw_stock_row(row)]
-    base_rows = latest_database_rows + latest_uploaded_rows
+    base_rows = latest_taiwan_stock_rows + latest_database_rows + latest_uploaded_rows
 
     if st.session_state.get("auto_pending"):
         with st.expander("待確認資料", expanded=False):

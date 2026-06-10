@@ -1379,6 +1379,38 @@ def database_counts():
     return revenue_count, institutional_count
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_taiwan_stock_rows():
+    init_stock_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT stock_id, MAX(date) AS latest_date
+            FROM monthly_revenue
+            WHERE stock_id GLOB '[0-9][0-9][0-9][0-9]'
+            GROUP BY stock_id
+            ORDER BY stock_id
+            """
+        ).fetchall()
+    return [
+        {
+            "檔名": "",
+            "股票": code,
+            "公司": "-",
+            "券商": "全台股",
+            "資料日期": latest_date or "-",
+            "建議/推薦": "",
+            "目前價": None,
+            "目標價": None,
+            "漲幅": None,
+            "狀態": "全台股",
+            "備註": "由本機月營收資料庫建立的全台股股票池",
+            "原文": "",
+        }
+        for code, latest_date in rows
+    ]
+
+
 def load_monthly_revenue_from_db(code):
     init_stock_database()
     with sqlite3.connect(DB_PATH) as conn:
@@ -1990,7 +2022,11 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
         source_rows.extend(row_with_gain(row) for row in SAMPLE_ROWS)
 
     stock_codes = stock_filter_codes(stock_filter)
-    existing_codes = {str(row.get("股票") or "").strip() for row in source_rows}
+    existing_codes = {
+        str(row.get("股票") or "").strip()
+        for row in source_rows
+        if str(row.get("狀態") or "") != "全台股"
+    }
     for code in stock_codes:
         if code in existing_codes:
             continue
@@ -2049,7 +2085,13 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
     metrics = []
     rate = scenario_rate(scenario)
     for _, row in df.iterrows():
-        item = history_metrics(row["股票"], history_days)
+        local_universe_only = str(row.get("狀態") or "") == "全台股" and number(row.get("目前價")) is None and number(row.get("目標價")) is None
+        item = {
+            "歷史報酬": None,
+            "波動": None,
+            "最大回撤": None,
+            "低基期位置": None,
+        } if local_universe_only else history_metrics(row["股票"], history_days)
         current = number(row.get("目前價"))
         target = number(row.get("目標價"))
         scenario_target = None if current is None or target is None else current + ((target - current) * rate)
@@ -2112,8 +2154,10 @@ def aggregate_stock_universe(report_df, history_days, scenario, low_base_limit=3
         avg_target = float(target_values.mean()) if not target_values.empty else None
         high_target = float(target_values.max()) if not target_values.empty else None
 
-        broker_list = sorted({value for value in group["券商"].dropna().astype(str) if value and value != "-"})
-        rating_list = sorted({value for value in group["建議/推薦"].dropna().astype(str) if value})
+        report_group = group[group["狀態"].astype(str) != "全台股"] if "狀態" in group else group
+        broker_source = report_group if not report_group.empty else group.iloc[0:0]
+        broker_list = sorted({value for value in broker_source["券商"].dropna().astype(str) if value and value not in {"-", "全台股"}})
+        rating_list = sorted({value for value in broker_source["建議/推薦"].dropna().astype(str) if value})
         latest_date = group["資料日期_dt"].dropna().max()
         latest_date_text = "-"
         if pd.notna(latest_date):
@@ -2125,12 +2169,30 @@ def aggregate_stock_universe(report_df, history_days, scenario, low_base_limit=3
         scenario_return = None if current is None or scenario_target is None or current == 0 else ((scenario_target - current) / current) * 100
         gain = None if current is None or avg_target is None or current == 0 else ((avg_target - current) / current) * 100
 
-        representative = group.iloc[-1].copy()
-        item = history_metrics(stock, history_days)
-        market = fetch_market_profile(stock, history_days)
+        representative = (report_group.iloc[-1] if not report_group.empty else group.iloc[-1]).copy()
+        local_universe_only = report_group.empty and current is None and avg_target is None
+        if local_universe_only:
+            item = {"歷史報酬": None, "波動": None, "最大回撤": None, "低基期位置": None}
+            market = {"平均成交張數": None, "市值百萬元": None, "行情代號": ""}
+            signals = {
+                "三率三升": False,
+                "三率原因": "全台股基礎池尚未抓取 YF 財報",
+                "營收條件": False,
+                "營收特徵": "",
+                "營收原因": "全台股基礎池未進行逐檔策略補強",
+                "營收MoM": None,
+                "累積YoY": None,
+                "法人買入": False,
+                "法人原因": "全台股基礎池未進行逐檔法人補強",
+                "外資投信買超張數": None,
+                "策略資料來源": "全台股基礎池",
+            }
+        else:
+            item = history_metrics(stock, history_days)
+            market = fetch_market_profile(stock, history_days)
+            signals = fetch_yfinance_strategy_signals(stock, finmind_token, allow_finmind_update)
         rating_text = " / ".join(rating_list)
         broker_text = " / ".join(broker_list)
-        signals = fetch_yfinance_strategy_signals(stock, finmind_token, allow_finmind_update)
         low_base_pass = item["低基期位置"] is not None and item["低基期位置"] <= low_base_limit
         volume_pass = market["平均成交張數"] is not None and market["平均成交張數"] >= min_volume_lots
         market_cap_pass = market["市值百萬元"] is not None and market["市值百萬元"] >= min_market_cap_million
@@ -2175,7 +2237,7 @@ def aggregate_stock_universe(report_df, history_days, scenario, low_base_limit=3
             "市值百萬元": market["市值百萬元"],
             "策略通過": strategy_pass,
             "建議分數": max([rating_score(value) for value in rating_list] or [0]),
-            "報告筆數": len(group),
+            "報告筆數": len(report_group),
             "券商數": len(broker_list),
         })
 
