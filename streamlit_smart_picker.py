@@ -18,6 +18,10 @@ def init_smart_state():
     st.session_state.setdefault("smart_picker_db_import_requested", False)
 
 
+def is_tw_stock_row(row):
+    return str(row.get("股票") or "").strip().isdigit() and len(str(row.get("股票") or "").strip()) == 4
+
+
 def render_database_controls():
     st.header("本機資料庫")
     revenue_count, institutional_count = core.database_counts()
@@ -516,15 +520,17 @@ def render_smart_picker():
     st.title("智慧選股")
     st.caption("上傳券商報告建立股票池，再用低基期、三率三升、營收、法人、成交量與市值條件做交集篩選。")
 
-    uploaded_rows = st.session_state.get("auto_rows", [])
-    database_rows = core.load_broker_database_rows()
+    uploaded_rows = [row for row in st.session_state.get("auto_rows", []) if is_tw_stock_row(row)]
+    database_rows_all = core.load_broker_database_rows()
+    database_rows = [row for row in database_rows_all if is_tw_stock_row(row)]
     brokers = sorted({row.get("券商", "-") for row in uploaded_rows + database_rows + core.SAMPLE_ROWS if row.get("券商")})
 
     with st.sidebar:
         st.header("券商資料庫")
         db_files, db_reports = core.broker_database_counts()
         st.caption(f"檔案 {db_files:,} 個；報告 {db_reports:,} 筆")
-        use_broker_database = st.checkbox("載入券商資料庫", value=db_reports > 0, disabled=db_reports == 0)
+        st.caption(f"台股可用報告 {len(database_rows):,} 筆；空白、產業報告與美股已排除")
+        use_broker_database = st.checkbox("載入券商資料庫", value=bool(database_rows), disabled=not bool(database_rows))
         st.caption("勾選後會把 broker_reports.db 內的券商報告加入智慧選股股票池。")
         active_report_rows = (database_rows if use_broker_database else []) + uploaded_rows
 
@@ -591,7 +597,9 @@ def render_smart_picker():
         stock_filter = st.text_input("篩選股票代碼", placeholder="例如 2308, 6805")
         broker_filter = st.multiselect("篩選券商", brokers)
 
-    base_rows = (core.load_broker_database_rows() if use_broker_database else []) + st.session_state.get("auto_rows", [])
+    latest_database_rows = [row for row in core.load_broker_database_rows() if is_tw_stock_row(row)] if use_broker_database else []
+    latest_uploaded_rows = [row for row in st.session_state.get("auto_rows", []) if is_tw_stock_row(row)]
+    base_rows = latest_database_rows + latest_uploaded_rows
 
     if st.session_state.get("auto_pending"):
         with st.expander("待確認資料", expanded=False):
