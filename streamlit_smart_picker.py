@@ -444,9 +444,12 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
 
     st.write("")
     pool = st.radio("股票池", ["精選池", "全市場", "預警池"], horizontal=True, label_visibility="collapsed")
-    display_cap = min(50, len(universe))
+    if pool == "精選池":
+        display_cap = min(int(max_stocks), len(selected))
+    else:
+        display_cap = min(50, len(universe))
     min_display = 5
-    default_display = min(display_cap, max(10, int(max_stocks)))
+    default_display = min(display_cap, int(max_stocks) if pool == "精選池" else max(10, int(max_stocks)))
     c1, c2, c3 = st.columns([1, 1.25, 1.25])
     with c1:
         if display_cap > min_display:
@@ -489,6 +492,8 @@ def render_smart_dashboard(stock_universe, selected, max_stocks):
     if sort_col in frame:
         frame = frame.sort_values(sort_col, ascending=ascending, na_position="last")
     frame = frame.head(show_count)
+    if pool == "精選池":
+        frame = frame.head(int(max_stocks))
 
     if frame.empty:
         if pool == "精選池":

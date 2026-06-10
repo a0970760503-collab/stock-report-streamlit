@@ -1928,7 +1928,11 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
     for column, default in defaults.items():
         if column not in df:
             df[column] = default
-    df["股票"] = df["股票"].astype(str)
+    df["股票"] = df["股票"].astype(str).str.strip()
+    df = df[df["股票"].str.fullmatch(r"\d{4}", na=False)]
+    if df.empty:
+        return df.reset_index(drop=True)
+
     df["券商"] = df["券商"].fillna("-").replace("", "-")
     df["公司"] = df["公司"].fillna("-").replace("", "-")
     df["建議/推薦"] = df["建議/推薦"].fillna("")
