@@ -599,7 +599,11 @@ def render_smart_picker():
         max_drawdown_limit = st.slider("最大回撤下限 (%)", min_value=-100.0, max_value=0.0, value=-35.0, step=1.0)
         max_stocks = st.number_input("最多選入股票數量", min_value=1, max_value=30, value=8, step=1)
         weight_mode = st.selectbox("權重模式", ["等權重", "依智慧分數", "依情境報酬"])
-        stock_filter = st.text_input("篩選股票代碼", placeholder="例如 2308, 6805")
+        stock_filter = st.text_input(
+            "篩選 / YF 查詢股票代碼",
+            placeholder="例如 2308, 6805",
+            help="可直接輸入台股四碼；資料庫沒有券商報告時，會用 Yahoo Finance 行情與分析師目標價建立候選資料。",
+        )
         broker_filter = st.multiselect("篩選券商", brokers)
 
     latest_database_rows = [row for row in core.load_broker_database_rows() if is_tw_stock_row(row)] if use_broker_database else []
@@ -644,7 +648,7 @@ def render_smart_picker():
     selected = core.add_weights(selected_raw, weight_mode)
 
     if stock_universe.empty:
-        st.info("尚無候選股票。請先載入券商資料庫、上傳報告，或勾選使用範例資料。")
+        st.info("尚無候選股票。請先載入券商資料庫、上傳報告、輸入台股代碼查 YF，或勾選使用範例資料。")
         return
 
     render_smart_dashboard(stock_universe, selected, max_stocks)

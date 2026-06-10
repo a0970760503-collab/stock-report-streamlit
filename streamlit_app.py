@@ -1073,6 +1073,88 @@ def row_with_gain(row):
     return item
 
 
+def stock_filter_codes(stock_filter):
+    codes = []
+    seen = set()
+    for token in re.split(r"[,，\s]+", stock_filter or ""):
+        code = token.strip().upper()
+        code = re.sub(r"\.(?:TW|TWO|TT)$", "", code, flags=re.IGNORECASE)
+        if not re.fullmatch(r"\d{4}", code):
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+    return codes
+
+
+def yfinance_rating_label(value):
+    key = str(value or "").strip().lower().replace("_", "-")
+    labels = {
+        "strong-buy": "買進",
+        "buy": "買進",
+        "hold": "持有",
+        "underperform": "減碼",
+        "sell": "賣出",
+    }
+    return labels.get(key, str(value or "").strip())
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def yfinance_report_row(stock_code):
+    stock_code = str(stock_code or "").strip()
+    if not re.fullmatch(r"\d{4}", stock_code):
+        return None
+
+    quote = fetch_quote(stock_code)
+    current = quote.get("price")
+    company = quote.get("name") or "-"
+    symbol = quote.get("symbol") or ""
+
+    info = {}
+    target = None
+    rating = ""
+    analyst_count = None
+    for candidate in yfinance_symbols(stock_code):
+        try:
+            ticker_info = yf.Ticker(candidate).get_info()
+        except Exception:
+            ticker_info = {}
+        if not ticker_info:
+            continue
+        info = ticker_info
+        symbol = symbol or candidate
+        company = company if company != "-" else (info.get("longName") or info.get("shortName") or "-")
+        current = current or number(info.get("currentPrice")) or number(info.get("regularMarketPrice"))
+        target = number(info.get("targetMeanPrice")) or number(info.get("targetMedianPrice"))
+        rating = yfinance_rating_label(info.get("recommendationKey"))
+        analyst_count = info.get("numberOfAnalystOpinions")
+        break
+
+    if current is None:
+        return None
+
+    note = f"YF:{symbol or stock_code}"
+    if analyst_count:
+        note += f"；分析師 {analyst_count} 位"
+
+    return {
+        "檔名": "",
+        "股票": stock_code,
+        "公司": company,
+        "券商": "Yahoo Finance",
+        "資料日期": datetime.today().strftime("%Y/%m/%d"),
+        "建議/推薦": rating,
+        "目前價": current,
+        "目標價": target,
+        "漲幅": None,
+        "狀態": "YF",
+        "備註": note,
+        "原文": "",
+        "評價原因": "由 Yahoo Finance 即時行情與分析師目標價建立；若 YF 無目標價，仍可進行歷史與策略檢核。",
+    }
+
+
 def parse_report_date_value(value):
     text = str(value or "").strip()
     if not text or text == "-":
@@ -1907,6 +1989,16 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
     if use_sample:
         source_rows.extend(row_with_gain(row) for row in SAMPLE_ROWS)
 
+    stock_codes = stock_filter_codes(stock_filter)
+    existing_codes = {str(row.get("股票") or "").strip() for row in source_rows}
+    for code in stock_codes:
+        if code in existing_codes:
+            continue
+        yf_row = yfinance_report_row(code)
+        if yf_row:
+            source_rows.append(row_with_gain(yf_row))
+            existing_codes.add(code)
+
     if not source_rows:
         return pd.DataFrame()
 
@@ -1945,7 +2037,6 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
         cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=recent_days)
         df = df[df["資料日期_dt"].notna() & (df["資料日期_dt"] >= cutoff)]
 
-    stock_codes = [code.strip() for code in re.split(r"[,，\s]+", stock_filter or "") if code.strip()]
     if stock_codes:
         df = df[df["股票"].isin(stock_codes)]
 
