@@ -2233,7 +2233,18 @@ def rating_score(value):
     return 0.0
 
 
-def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_filter, broker_filter, history_days, scenario):
+def build_selection_universe(
+    rows,
+    use_sample,
+    recent_only,
+    recent_days,
+    stock_filter,
+    broker_filter,
+    history_days,
+    scenario,
+    hydrate_prices=True,
+    include_history_metrics=True,
+):
     source_rows = [row_with_gain(row) for row in rows]
     if use_sample:
         source_rows.extend(row_with_gain(row) for row in SAMPLE_ROWS)
@@ -2300,7 +2311,8 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
     if df.empty:
         return df.reset_index(drop=True)
 
-    df = fill_missing_current_prices(df)
+    if hydrate_prices:
+        df = fill_missing_current_prices(df)
     df["漲幅"] = df.apply(lambda row: calculate_upside(row.get("目前價"), row.get("目標價")), axis=1)
 
     metrics = []
@@ -2312,7 +2324,7 @@ def build_selection_universe(rows, use_sample, recent_only, recent_days, stock_f
             "波動": None,
             "最大回撤": None,
             "低基期位置": None,
-        } if local_universe_only else history_metrics(row["股票"], history_days)
+        } if local_universe_only or not include_history_metrics else history_metrics(row["股票"], history_days)
         current = number(row.get("目前價"))
         target = number(row.get("目標價"))
         scenario_target = None if current is None or target is None else current + ((target - current) * rate)
@@ -3034,7 +3046,7 @@ def broker_reason_df(related_reports):
     return pd.DataFrame(rows)
 
 
-def broker_portfolio_universe(report_df, history_days):
+def broker_portfolio_universe(report_df, history_days, include_history=True):
     summary = report_stock_summary_df(report_df)
     if summary.empty:
         return pd.DataFrame()
@@ -3050,7 +3062,11 @@ def broker_portfolio_universe(report_df, history_days):
 
     metrics = []
     for _, row in result.iterrows():
-        item = history_metrics(row["股票"], history_days)
+        item = history_metrics(row["股票"], history_days) if include_history else {
+            "歷史報酬": None,
+            "波動": None,
+            "最大回撤": None,
+        }
         metrics.append({
             "歷史報酬": item["歷史報酬"],
             "波動": item["波動"],
@@ -3142,6 +3158,8 @@ def render_broker_report_analysis_app(mode="admin"):
         broker_filter,
         history_days,
         scenario,
+        hydrate_prices=False,
+        include_history_metrics=False,
     )
     report_universe = build_selection_universe(
         base_rows,
@@ -3152,9 +3170,11 @@ def render_broker_report_analysis_app(mode="admin"):
         broker_filter,
         history_days,
         scenario,
+        hydrate_prices=False,
+        include_history_metrics=False,
     )
 
-    portfolio_universe = broker_portfolio_universe(report_universe, history_days)
+    portfolio_universe = broker_portfolio_universe(report_universe, history_days, include_history=False)
 
     tab_names = ["📋 報告總覽", "📌 個股彙整", "🔍 個股分析", "📦 投資組合"]
     if is_admin:
@@ -3210,6 +3230,11 @@ def render_broker_report_analysis_app(mode="admin"):
             stock_code = selected_label.split("/")[0].strip()
             row = portfolio_universe[portfolio_universe["股票"].astype(str) == stock_code].iloc[0]
             related_reports = report_universe[report_universe["股票"].astype(str) == stock_code]
+            related_reports = fill_missing_current_prices(related_reports)
+            related_reports["漲幅"] = related_reports.apply(lambda item: calculate_upside(item.get("目前價"), item.get("目標價")), axis=1)
+            hydrated_row = broker_portfolio_universe(related_reports, history_days, include_history=True)
+            if not hydrated_row.empty:
+                row = hydrated_row.iloc[0]
 
             st.markdown(f"### {tw_symbol(stock_code)} {row.get('公司', '')}")
             k1, k2, k3, k4 = st.columns(4)
@@ -3252,7 +3277,10 @@ def render_broker_report_analysis_app(mode="admin"):
             options = portfolio_universe["股票"].astype(str).tolist()
             default_options = options[: min(5, len(options))]
             chosen_codes = st.multiselect("選擇納入投資組合的股票", options, default=default_options, key="broker_portfolio_codes")
-            portfolio_rows = portfolio_universe[portfolio_universe["股票"].astype(str).isin(chosen_codes)].copy()
+            selected_reports = report_universe[report_universe["股票"].astype(str).isin(chosen_codes)].copy()
+            selected_reports = fill_missing_current_prices(selected_reports)
+            selected_reports["漲幅"] = selected_reports.apply(lambda item: calculate_upside(item.get("目前價"), item.get("目標價")), axis=1)
+            portfolio_rows = broker_portfolio_universe(selected_reports, history_days, include_history=True)
 
             if portfolio_rows.empty:
                 st.info("請至少選擇一檔股票。")
